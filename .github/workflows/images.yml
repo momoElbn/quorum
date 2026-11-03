@@ -1,0 +1,91 @@
+# Builds the container images and publishes them to GitHub's container
+# registry (GHCR):
+#   ghcr.io/momoelbn/quorum-server
+#   ghcr.io/momoelbn/quorum-operator
+#
+# On a pull request: build only, to prove the images still build.
+# On a push to main: build and push, tagged with the commit (sha-1a2b3c4)
+#   and "main".
+# On a version tag (git tag v0.2.0): build and push, tagged 0.2.0 and 0.2.
+#
+# For GitOps, deploy the immutable tags (sha-... or a version), not "main":
+# "main" moves with every merge, so the cluster couldn't tell it changed.
+name: Images
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# Read the code, and write packages (GHCR images). GITHUB_TOKEN gets only
+# these permissions, and pull requests never use the write access (they
+# don't log in or push).
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The same steps for both images, run in parallel.
+    strategy:
+      fail-fast: false # one broken image shouldn't cancel the other's build
+      matrix:
+        include:
+          - name: quorum-server
+            context: . # the root Dockerfile
+          - name: quorum-operator
+            context: operator # operator/Dockerfile
+    steps:
+      - uses: actions/checkout@v7
+
+      # Buildx is Docker's builder. We need it for the build cache below.
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The workflow's own short-lived token. No personal token or
+          # secret to manage.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Works out the tags and the OCI labels for this run. The labels
+      # include org.opencontainers.image.source, which links the package
+      # to this repo on GitHub.
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          # Registry paths must be lower case, so the owner is spelled
+          # "momoelbn", not "momoElbn".
+          images: ghcr.io/momoelbn/${{ matrix.name }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          # Only linux/amd64: the k3d nodes and the GitHub runners are amd64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers from earlier runs (e.g. Go module downloads), kept
+          # in GitHub Actions' cache, one cache per image.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
