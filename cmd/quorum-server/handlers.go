@@ -36,6 +36,7 @@ func newHandler(st *store.Store, peers map[string]string, reg *prometheus.Regist
 	mux.HandleFunc("POST /remove", s.handleRemove)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	return mux
 }
@@ -181,6 +182,20 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if s.store.State() == "shutdown" {
 		http.Error(w, "raft is shut down", http.StatusServiceUnavailable)
+		return
+	}
+	io.WriteString(w, "ok\n")
+}
+
+// handleReadyz answers 200 when this node can serve clients, and 503 with
+// the reason when it can't (see store.Ready for the rules).
+//
+// Kubernetes uses it for the readiness probe: a pod that fails it is taken
+// out of the client Service but not restarted. So unlike /healthz, it can
+// and should fail while there is no leader.
+func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.Ready(); err != nil {
+		http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	io.WriteString(w, "ok\n")

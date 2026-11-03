@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// testPeers lists every node ID the tests use, so Ready finds the leader in
+// it. The store never dials these addresses; only the HTTP layer does.
+var testPeers = map[string]string{"node0": "unused", "node1": "unused", "node2": "unused"}
+
 // openStore starts one node on a free localhost port. bind may be empty to
 // pick a random port.
 func openStore(t *testing.T, id, dir, bind string, bootstrap bool) *Store {
@@ -14,7 +18,7 @@ func openStore(t *testing.T, id, dir, bind string, bootstrap bool) *Store {
 	if bind == "" {
 		bind = "127.0.0.1:0"
 	}
-	s := New(Config{NodeID: id, RaftBind: bind, DataDir: dir, LogOutput: io.Discard})
+	s := New(Config{NodeID: id, RaftBind: bind, DataDir: dir, Peers: testPeers, LogOutput: io.Discard})
 	if err := s.Open(bootstrap); err != nil {
 		t.Fatalf("open %s: %v", id, err)
 	}

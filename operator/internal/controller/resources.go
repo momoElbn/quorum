@@ -100,8 +100,13 @@ func headlessService(qc *quorumv1alpha1.QuorumCluster) *corev1ac.ServiceApplyCon
 		WithOwnerReferences(ownerRef(qc)).
 		WithSpec(corev1ac.ServiceSpec().
 			WithClusterIP(corev1.ClusterIPNone).
-			// Publish DNS records for pods that aren't Ready yet, so Raft
-			// peers can reach each other while starting up.
+			// Publish DNS records for pods that aren't Ready yet. This is
+			// essential: a pod is Ready (/readyz) only once it knows a
+			// leader, and a leader can only be elected if the pods can
+			// reach each other by name. Without this, unready pods would
+			// lose their DNS names, so they couldn't elect a leader, so
+			// they would never become ready (on a cold start or after a
+			// majority restarts).
 			WithPublishNotReadyAddresses(true).
 			WithSelector(selectorLabels(qc)).
 			WithPorts(
@@ -181,10 +186,16 @@ func statefulSet(qc *quorumv1alpha1.QuorumCluster, clusterDomain string) *appsv1
 			env("PEERS_HTTP", strings.Join(peers, ",")),
 		).
 		WithVolumeMounts(corev1ac.VolumeMount().WithName("data").WithMountPath(dataDir)).
-		// /healthz doesn't check for a leader: failing liveness during a
-		// network split would restart every pod and slow down recovery.
-		WithLivenessProbe(healthzProbe(10, 3)).
-		WithReadinessProbe(healthzProbe(5, 2)).
+		// Liveness: /healthz doesn't check for a leader. Failing liveness
+		// during a network split would restart every pod and slow down
+		// recovery.
+		WithLivenessProbe(httpProbe("/healthz", 10, 3)).
+		// Readiness: /readyz fails while the pod can't serve clients (no
+		// leader, cut off from it, not a voter, far behind). Kubernetes then
+		// only takes the pod out of the client Service. Checked every
+		// second, so a pod leaves the Service within about 3s of losing
+		// the leader and rejoins 1s after it recovers.
+		WithReadinessProbe(httpProbe("/readyz", 1, 3).WithSuccessThreshold(1)).
 		WithResources(corev1ac.ResourceRequirements().
 			WithRequests(corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("50m"),
@@ -258,9 +269,9 @@ func fieldEnv(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
 		WithFieldRef(corev1ac.ObjectFieldSelector().WithFieldPath(fieldPath)))
 }
 
-func healthzProbe(periodSeconds, failureThreshold int32) *corev1ac.ProbeApplyConfiguration {
+func httpProbe(path string, periodSeconds, failureThreshold int32) *corev1ac.ProbeApplyConfiguration {
 	return corev1ac.Probe().
-		WithHTTPGet(corev1ac.HTTPGetAction().WithPath("/healthz").WithPort(intstr.FromString("http"))).
+		WithHTTPGet(corev1ac.HTTPGetAction().WithPath(path).WithPort(intstr.FromString("http"))).
 		WithPeriodSeconds(periodSeconds).
 		WithFailureThreshold(failureThreshold)
 }

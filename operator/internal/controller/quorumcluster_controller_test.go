@@ -159,6 +159,16 @@ func TestReconcileCreatesOwnedObjects(t *testing.T) {
 			t.Errorf("env %s = %q, want %q", k, got, want)
 		}
 	}
+	// Liveness and readiness must use different endpoints: /healthz never
+	// checks for a leader (so a split doesn't restart every pod), /readyz
+	// does (so pods without a leader leave the client Service).
+	if p := c.LivenessProbe; p == nil || p.HTTPGet == nil || p.HTTPGet.Path != "/healthz" {
+		t.Errorf("liveness probe = %+v, want GET /healthz", p)
+	}
+	if p := c.ReadinessProbe; p == nil || p.HTTPGet == nil || p.HTTPGet.Path != "/readyz" ||
+		p.PeriodSeconds != 1 || p.FailureThreshold != 3 || p.SuccessThreshold != 1 {
+		t.Errorf("readiness probe = %+v, want GET /readyz every 1s, failureThreshold 3, successThreshold 1", p)
+	}
 	if peers := envValue(c, "PEERS_HTTP"); strings.Count(peers, "=") != 3 || !strings.HasPrefix(peers, "quorum-0="+host0) {
 		t.Errorf("PEERS_HTTP = %q", peers)
 	}

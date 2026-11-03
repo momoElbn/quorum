@@ -12,9 +12,12 @@ metadata:
     {{- include "quorum.labels" . | nindent 4 }}
 spec:
   clusterIP: None
-  # Publish DNS records even for pods that aren't Ready yet. Raft peers must
-  # reach each other while starting up, for example to elect a leader
-  # before any pod reports Ready. Without this, a cold start could deadlock.
+  # Publish DNS records even for pods that aren't Ready yet. This is
+  # essential: a pod is Ready (/readyz) only once it knows a leader, and a
+  # leader can only be elected if the pods can reach each other by name.
+  # Without this, unready pods would lose their DNS names, so they couldn't
+  # elect a leader, so they would never become ready (on a cold start, or
+  # after a majority of pods restarts).
   publishNotReadyAddresses: true
   selector:
     {{- include "quorum.selectorLabels" . | nindent 4 }}
