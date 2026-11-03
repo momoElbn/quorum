@@ -190,6 +190,8 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		ClusterDomain: clusterDomain,
 		FetchStatus:   controller.FetchStatusHTTP,
+		Members:       controller.HTTPMembership{},
+		Recorder:      mgr.GetEventRecorder("quorum-operator"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "quorumcluster")
 		os.Exit(1)

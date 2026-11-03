@@ -111,7 +111,7 @@ func TestQueryNodesUsesStableDNSNames(t *testing.T) {
 		mu.Unlock()
 		return NodeStatus{}, nil
 	}
-	got := queryNodes(context.Background(), fetch, testCluster(), "cluster.local")
+	got := queryNodes(context.Background(), fetch, testCluster(), 3, "cluster.local")
 	if len(got) != 3 {
 		t.Fatalf("got %d answers, want 3", len(got))
 	}

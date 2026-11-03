@@ -70,25 +70,38 @@ means a write was really lost.
 
 ### Results
 
-| | Run 1 | Run 2 |
-|---|---|---|
-| Leader kills | 29 | 29 |
-| Writes sent | 179,999 | 180,000 |
-| Acknowledged | 172,650 (95.9 %) | 171,777 (95.4 %) |
-| **Lost acknowledged writes** | **0** | **0** |
-| **Failover time, median** | **2.05 s** | **2.20 s** |
-| **Failover time, max** | **3.21 s** | **2.91 s** |
-| Disruption per kill, median / max | 2.29 s / 8.25 s | 2.24 s / 9.00 s |
-| Total time unavailable | 73.5 s (4.1 %) | 82.2 s (4.6 %) |
-| Failed writes that were applied anyway | 61 | 47 |
+Runs 1 and 2 are the baseline. Run 3 adds the readiness fix (`/readyz`): a pod
+gets client traffic only once it knows the leader.
 
-- **Nothing was lost:** all 344,427 acknowledged writes were read back correctly.
+| | Run 1 | Run 2 | Run 3 (readiness fix) |
+|---|---|---|---|
+| Leader kills during the write phase | 29 | 29 | 28 ¹ |
+| Writes sent | 179,999 | 180,000 | 179,997 |
+| Acknowledged | 172,650 (95.9 %) | 171,777 (95.4 %) | 172,904 (96.1 %) |
+| **Lost acknowledged writes** | **0** | **0** | **0** |
+| **Failover time, median** | **2.05 s** | **2.20 s** | **2.22 s** |
+| **Failover time, max** | **3.21 s** | **2.91 s** | **3.69 s** |
+| Disruption per kill, median / max | 2.29 s / 8.25 s | 2.24 s / 9.00 s | 2.22 s / 5.32 s ² |
+| Kills with a second outage after the election | 6 | 4 | 1 |
+| Total time unavailable | 73.5 s (4.1 %) | 82.2 s (4.6 %) | 70.9 s (3.9 %) |
+| Failed writes that were applied anyway | 61 | 47 | 74 |
+
+¹ One round found no leader (an election was running) and was skipped, so the 29th kill came after the writes ended.
+² 21.11 s if you also count an election that started 18 s after the kill, with no kill causing it (see below).
+
+- **Nothing was lost:** all 517,331 acknowledged writes were read back correctly.
 - **Failover time:** for each kill, the longest write outage that starts within 5 s of it. The median of about 2 s
-  matches hashicorp/raft's defaults (a follower waits 1–2 s without a heartbeat before it calls an election). The two runs
-  differ by 0.15 s.
-- **Disruption per kill** also counts errors after the election. On 6 kills (run 1) and 4 kills (run 2), writes failed again for
-  up to 6.5 s. The replacement pod reports Ready before it knows who the leader is, so it answers `503 no leader`.
-  The next fix is to make readiness wait until the pod knows the leader.
+  matches hashicorp/raft's defaults (a follower waits 1–2 s without a heartbeat before it calls an election). The three
+  runs differ by at most 0.17 s on the median. Readiness doesn't change it: it's the election itself.
+- **Disruption per kill** also counts errors after the election. In runs 1 and 2, writes failed again for up to 6.5 s
+  after 6 and 4 kills: the replacement pod reported Ready before it knew the leader, got client traffic and answered
+  `503 no leader`. With `/readyz`, that's gone. The one remaining case in run 3 is two outages 1.7 s apart within the
+  same failover, which looks like a split vote.
+- **Elections without a kill:** run 3 had 3 short outages (2.0 s, 1.9 s, 3.0 s) that no kill caused, each 18–40 s after a
+  kill, around when the replacement pod comes back. The Raft term also rose far faster than the number of kills. The
+  likely cause is the returning pod triggering an election before the leader reaches it; the pods' logs were gone by
+  the time this was found, so it's not confirmed. The records of runs 1 and 2 are gone too, so it's unknown whether they
+  had them.
 - **Applied anyway:** the write was committed, but the leader died before it could reply. A failed write means
   "outcome unknown", so the checker reports these separately and doesn't count them as lost.
 
@@ -109,8 +122,8 @@ server never reach it, so only the checker sees those failures.*
 | Cluster | 3 replicas, one pod per node, 1 GiB local-path volume each |
 | Load | 100 writes/s for 30 min, 2 s client timeout |
 | Fault | leader SIGKILLed every 60 s, 29 times; next kill only once all 3 pods are Ready |
-| Version | quorum-server and quorum-operator at commit `be31ee1` |
-| Date | 2026-11-03; run 1 04:06–04:38 UTC, run 2 04:40–05:11 UTC |
+| Version | runs 1 and 2: commit `be31ee1`; run 3: commit `1e59c36` (readiness fix) |
+| Date | 2026-11-03; run 1 04:06–04:38 UTC, run 2 04:40–05:11 UTC, run 3 22:57–23:27 UTC |
 
 ## Repository layout
 
@@ -121,5 +134,5 @@ server never reach it, so only the checker sees those failures.*
 | `operator/` | kubebuilder operator (`QuorumCluster` CRD) |
 | `charts/` | Helm charts for the server and the operator |
 | `deploy/` | Docker Compose setup and an example `QuorumCluster` |
-| `scripts/` | `run-checker.sh`, `kill-leader.sh`, `status.sh`, `write-loop.sh` |
+| `scripts/` | `run-checker.sh`, `kill-leader.sh`, `scale-experiment.sh`, `status.sh`, `write-loop.sh` |
 | `.github/workflows/ci.yml` | test, build, push to GHCR, deploy via quorum-gitops |

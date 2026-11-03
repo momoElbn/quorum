@@ -11,15 +11,23 @@ type QuorumClusterSpec struct {
 	// Replicas is the number of Raft nodes. Use an odd number: 3 nodes
 	// survive 1 failure, 5 survive 2.
 	//
-	// It can't be changed after creation yet: adding or removing nodes
-	// also needs Raft membership changes (POST /join and /remove), which
-	// the operator doesn't do yet. The rule below makes the API server
-	// reject the change, instead of leaving Raft with members that no
-	// longer exist.
+	// Changing it scales the cluster. By default the operator does it
+	// safely, one Raft member at a time (see UnsafeScaling).
 	// +kubebuilder:default=3
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="replicas can't be changed yet (Raft membership changes aren't automated)"
 	Replicas int32 `json:"replicas"`
+
+	// UnsafeScaling turns off the operator's membership management. Pods
+	// join the cluster by themselves when they start (JOIN_ADDR), the
+	// StatefulSet is set to Replicas directly, and nothing is ever removed
+	// from Raft. Scaling down this way leaves dead voters in the
+	// configuration, which still count towards the majority. It exists as
+	// a baseline to measure safe scaling against; don't use it otherwise.
+	//
+	// Changing it changes the pod template, so every pod restarts.
+	// +kubebuilder:default=false
+	// +optional
+	UnsafeScaling bool `json:"unsafeScaling,omitempty"`
 
 	// Image is the quorum-server container image, e.g. "quorum-server:dev".
 	// Changing it triggers a rolling update, one pod at a time.
@@ -63,7 +71,53 @@ const (
 	// ConditionDegraded is True when the cluster runs with fewer healthy
 	// nodes than requested.
 	ConditionDegraded = "Degraded"
+	// ConditionScaling is True while the operator is changing the number of
+	// Raft members. False with reason Stuck means a step made no progress
+	// for too long and the operator stopped; it resumes when the spec
+	// changes.
+	ConditionScaling = "Scaling"
 )
+
+// ScalingStep is where a scale operation is. Scaling up goes AddingPod ->
+// CatchingUp -> Promoting for each new member; scaling down goes
+// [TransferringLeadership ->] Removing -> ShrinkingPods for each member.
+// +kubebuilder:validation:Enum=Idle;AddingPod;CatchingUp;Promoting;TransferringLeadership;Removing;ShrinkingPods
+type ScalingStep string
+
+const (
+	// StepIdle: the StatefulSet and the Raft membership match spec.replicas.
+	StepIdle ScalingStep = "Idle"
+	// StepAddingPod: the StatefulSet was raised by one; waiting for the new
+	// pod to answer.
+	StepAddingPod ScalingStep = "AddingPod"
+	// StepCatchingUp: the new pod joined as a nonvoter and is receiving
+	// the log.
+	StepCatchingUp ScalingStep = "CatchingUp"
+	// StepPromoting: the nonvoter has caught up and is being made a voter,
+	// then must become Ready.
+	StepPromoting ScalingStep = "Promoting"
+	// StepTransferringLeadership: the member to remove is the leader, so
+	// leadership is handed to another voter first.
+	StepTransferringLeadership ScalingStep = "TransferringLeadership"
+	// StepRemoving: the member is being removed from the Raft configuration.
+	StepRemoving ScalingStep = "Removing"
+	// StepShrinkingPods: the member is out of Raft; the StatefulSet is
+	// lowered by one, which deletes its pod and volume.
+	StepShrinkingPods ScalingStep = "ShrinkingPods"
+)
+
+// ScalingStatus is the progress of a scale operation.
+type ScalingStatus struct {
+	// Step is the current step.
+	Step ScalingStep `json:"step"`
+	// Member is the pod the step is about, e.g. "quorum-3".
+	// +optional
+	Member string `json:"member,omitempty"`
+	// Since is when this step (for this member) started. A step that
+	// doesn't finish within 5 minutes marks the cluster Stuck.
+	// +optional
+	Since metav1.Time `json:"since,omitempty"`
+}
 
 // QuorumClusterStatus is what the operator observed. Only the operator
 // writes it.
@@ -83,9 +137,18 @@ type QuorumClusterStatus struct {
 	// +optional
 	Members []string `json:"members,omitempty"`
 
+	// Replicas is the number of pods the StatefulSet currently runs. While
+	// scaling safely, it moves towards spec.replicas one at a time.
+	// +optional
+	Replicas int32 `json:"replicas"`
+
 	// ReadyReplicas is the number of pods passing their readiness probe.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas"`
+
+	// Scaling is the progress of the current scale operation.
+	// +optional
+	Scaling *ScalingStatus `json:"scaling,omitempty"`
 
 	// ObservedGeneration is the spec generation this status was computed
 	// for. If it's lower than metadata.generation, the operator hasn't
@@ -111,7 +174,9 @@ type QuorumClusterStatus struct {
 // which Kubernetes limits to 63 characters, so keep it short.
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 50",message="name must be at most 50 characters"
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="Current",type=integer,JSONPath=`.status.replicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
+// +kubebuilder:printcolumn:name="Scaling",type=string,JSONPath=`.status.scaling.step`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Leader",type=string,JSONPath=`.status.leader`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

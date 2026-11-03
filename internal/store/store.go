@@ -58,10 +58,16 @@ type Config struct {
 
 	DataDir string // where the Raft log, stable store and snapshots live
 
-	// Peers maps node IDs to HTTP addresses (PEERS_HTTP). The store itself
-	// never dials them; Ready only checks that the leader is listed, because
-	// a follower can't redirect clients to a leader it has no address for.
+	// Peers maps node IDs to HTTP addresses (PEERS_HTTP). The store never
+	// dials them; LeaderHTTPAddr uses them to tell clients where to go.
+	// Optional: see HTTPPort.
 	Peers map[string]string
+
+	// HTTPPort is this node's HTTP port, e.g. "8080". A leader missing from
+	// Peers is assumed to serve HTTP on the host of its Raft address, on
+	// this same port. That holds when every node runs from one template,
+	// as the pods of a StatefulSet do.
+	HTTPPort string
 
 	LogOutput io.Writer // where Raft writes its logs; nil means os.Stderr
 }
@@ -302,8 +308,22 @@ func notLeader(err error) error {
 
 // Join adds a node to the cluster as a voter. It is idempotent: joining
 // again with the same ID and address does nothing, so a node can retry
-// safely after a timeout.
+// safely after a timeout. If the node is already a nonvoter, Join promotes
+// it to voter.
 func (s *Store) Join(id, raftAddr string) error {
+	return s.join(id, raftAddr, raft.Voter)
+}
+
+// JoinNonvoter adds a node that receives the log but doesn't vote and
+// doesn't count towards the majority. A new node starts with an empty log;
+// as a nonvoter it can catch up without making commits wait for it. Joining
+// a node that is already a member (voter or not) does nothing: this never
+// demotes a voter.
+func (s *Store) JoinNonvoter(id, raftAddr string) error {
+	return s.join(id, raftAddr, raft.Nonvoter)
+}
+
+func (s *Store) join(id, raftAddr string, suffrage raft.ServerSuffrage) error {
 	f := s.raft.GetConfiguration()
 	if err := f.Error(); err != nil {
 		return err
@@ -312,7 +332,10 @@ func (s *Store) Join(id, raftAddr string) error {
 		sameID := srv.ID == raft.ServerID(id)
 		sameAddr := srv.Address == raft.ServerAddress(raftAddr)
 		if sameID && sameAddr {
-			return nil // already a member
+			if suffrage == raft.Nonvoter || srv.Suffrage == raft.Voter {
+				return nil // already a member with at least the asked-for role
+			}
+			break // a nonvoter asking to vote: AddVoter below promotes it
 		}
 		// The ID or the address is in use by an older entry, for example
 		// a node that came back with a new address. Remove the old entry
@@ -326,7 +349,13 @@ func (s *Store) Join(id, raftAddr string) error {
 	}
 	// prevIndex 0 means "apply this change whatever the current
 	// configuration is". Only the leader can change membership.
-	err := s.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(raftAddr), 0, applyTimeout).Error()
+	var err error
+	if suffrage == raft.Nonvoter {
+		err = s.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(raftAddr), 0, applyTimeout).Error()
+	} else {
+		// On an existing nonvoter, AddVoter changes its suffrage in place.
+		err = s.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(raftAddr), 0, applyTimeout).Error()
+	}
 	return notLeader(err)
 }
 
@@ -341,6 +370,35 @@ func (s *Store) Remove(id string) error {
 func (s *Store) Leader() (id, raftAddr string) {
 	addr, sid := s.raft.LeaderWithID()
 	return string(sid), string(addr)
+}
+
+// LeaderHTTPAddr returns the leader's ID and the host:port of its HTTP API,
+// for redirecting clients. ok is false while no leader is known, or if its
+// HTTP address can't be worked out.
+func (s *Store) LeaderHTTPAddr() (id, addr string, ok bool) {
+	id, raftAddr := s.Leader()
+	if id == "" {
+		return "", "", false
+	}
+	addr, ok = s.httpAddr(id, raftAddr)
+	return id, addr, ok
+}
+
+// httpAddr finds node id's HTTP address: from Peers if it's listed there,
+// otherwise the host of its Raft address with HTTPPort. In Kubernetes the
+// operator doesn't set PEERS_HTTP: it would list every replica, so changing
+// the replica count would change the pod template and restart every pod.
+// The Raft address is the pod's stable DNS name, and all pods use the same
+// HTTP port, so the derived address is right.
+func (s *Store) httpAddr(id, raftAddr string) (string, bool) {
+	if a, ok := s.cfg.Peers[id]; ok {
+		return a, true
+	}
+	host, _, err := net.SplitHostPort(raftAddr)
+	if err != nil || host == "" || s.cfg.HTTPPort == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, s.cfg.HTTPPort), true
 }
 
 // TransferLeadership asks Raft to hand leadership to another voter. A

@@ -36,15 +36,21 @@ func newNamespace(t *testing.T) string {
 	return name
 }
 
-// createCluster creates a 3-replica QuorumCluster named "quorum".
+// createCluster creates a 3-replica QuorumCluster named "quorum", in safe
+// scaling mode.
 func createCluster(t *testing.T) *quorumv1alpha1.QuorumCluster {
+	return createClusterWith(t, 3, false)
+}
+
+func createClusterWith(t *testing.T, replicas int32, unsafe bool) *quorumv1alpha1.QuorumCluster {
 	t.Helper()
 	qc := &quorumv1alpha1.QuorumCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "quorum", Namespace: newNamespace(t)},
 		Spec: quorumv1alpha1.QuorumClusterSpec{
-			Replicas:    3,
-			Image:       "quorum-server:dev",
-			StorageSize: resource.MustParse("1Gi"),
+			Replicas:      replicas,
+			Image:         "quorum-server:dev",
+			StorageSize:   resource.MustParse("1Gi"),
+			UnsafeScaling: unsafe,
 		},
 	}
 	if err := k8sClient.Create(ctx, qc); err != nil {
@@ -70,9 +76,7 @@ func (f fakeNodes) fetch(_ context.Context, url string) (NodeStatus, error) {
 // healthyNodes is what a formed 3-node cluster answers: quorum-0 leads and
 // all three are members.
 func healthyNodes() fakeNodes {
-	members := []struct {
-		ID string `json:"id"`
-	}{{"quorum-0"}, {"quorum-1"}, {"quorum-2"}}
+	members := []NodeMember{{"quorum-0", true}, {"quorum-1", true}, {"quorum-2", true}}
 	f := fakeNodes{}
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("quorum-%d", i)
@@ -91,6 +95,7 @@ func newReconciler(f fakeNodes) *QuorumClusterReconciler {
 		Scheme:        scheme,
 		ClusterDomain: "cluster.local",
 		FetchStatus:   f.fetch,
+		Members:       &fakeRaft{}, // records calls; these tests make none
 	}
 }
 
@@ -132,27 +137,35 @@ func envValue(c corev1.Container, name string) string {
 func TestReconcileCreatesOwnedObjects(t *testing.T) {
 	qc := createCluster(t)
 	res := reconcile(t, newReconciler(healthyNodes()), qc)
-	if res.RequeueAfter != statusPollInterval {
-		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, statusPollInterval)
+	// Safe mode starts at 1 pod and grows from there, so it is "scaling"
+	// and comes back soon.
+	if res.RequeueAfter != scalingPollInterval {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, scalingPollInterval)
 	}
 	ns := qc.Namespace
 
 	var sts appsv1.StatefulSet
 	get(t, ns, "quorum", &sts)
 	checkOwned(t, &sts, qc)
-	if *sts.Spec.Replicas != 3 || sts.Spec.ServiceName != "quorum-headless" {
-		t.Errorf("replicas=%d serviceName=%q", *sts.Spec.Replicas, sts.Spec.ServiceName)
+	if *sts.Spec.Replicas != 1 || sts.Spec.ServiceName != "quorum-headless" {
+		t.Errorf("replicas=%d serviceName=%q, want 1 (safe mode starts with pod 0) and quorum-headless", *sts.Spec.Replicas, sts.Spec.ServiceName)
+	}
+	if p := sts.Spec.PersistentVolumeClaimRetentionPolicy; p == nil || p.WhenScaled != appsv1.DeletePersistentVolumeClaimRetentionPolicyType ||
+		p.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+		t.Errorf("PVC retention = %+v, want whenScaled Delete, whenDeleted Retain", p)
 	}
 	c := sts.Spec.Template.Spec.Containers[0]
 	if c.Image != "quorum-server:dev" {
 		t.Errorf("image = %q", c.Image)
 	}
-	host0 := "quorum-0.quorum-headless." + ns + ".svc.cluster.local"
 	wantEnv := map[string]string{
 		"NODE_ID":        "$(POD_NAME)",
 		"RAFT_ADDR":      "$(POD_NAME).quorum-headless.$(POD_NAMESPACE).svc.cluster.local:7000",
 		"BOOTSTRAP_NODE": "quorum-0",
-		"JOIN_ADDR":      host0 + ":8080",
+		// The operator owns membership: pods don't join by themselves, and
+		// nothing in the template depends on the replica count.
+		"JOIN_ADDR":  "",
+		"PEERS_HTTP": "",
 	}
 	for k, want := range wantEnv {
 		if got := envValue(c, k); got != want {
@@ -168,9 +181,6 @@ func TestReconcileCreatesOwnedObjects(t *testing.T) {
 	if p := c.ReadinessProbe; p == nil || p.HTTPGet == nil || p.HTTPGet.Path != "/readyz" ||
 		p.PeriodSeconds != 1 || p.FailureThreshold != 3 || p.SuccessThreshold != 1 {
 		t.Errorf("readiness probe = %+v, want GET /readyz every 1s, failureThreshold 3, successThreshold 1", p)
-	}
-	if peers := envValue(c, "PEERS_HTTP"); strings.Count(peers, "=") != 3 || !strings.HasPrefix(peers, "quorum-0="+host0) {
-		t.Errorf("PEERS_HTTP = %q", peers)
 	}
 	vct := sts.Spec.VolumeClaimTemplates
 	if len(vct) != 1 || vct[0].Name != "data" || vct[0].Spec.Resources.Requests.Storage().String() != "1Gi" {
@@ -379,17 +389,20 @@ func TestCRDValidation(t *testing.T) {
 		t.Errorf("defaults: replicas=%d storageSize=%s, want 3 and 1Gi", qc.Spec.Replicas, qc.Spec.StorageSize.String())
 	}
 
-	// replicas and storageSize can't change after creation.
-	changes := map[string]func(*quorumv1alpha1.QuorumCluster){
-		"replicas":    func(c *quorumv1alpha1.QuorumCluster) { c.Spec.Replicas = 5 },
-		"storageSize": func(c *quorumv1alpha1.QuorumCluster) { c.Spec.StorageSize = resource.MustParse("2Gi") },
+	if qc.Spec.UnsafeScaling {
+		t.Error("unsafeScaling defaults to true, want false")
 	}
-	for field, change := range changes {
-		get(t, ns, "defaults", qc)
-		change(qc)
-		if err := k8sClient.Update(ctx, qc); err == nil || !strings.Contains(err.Error(), field) {
-			t.Errorf("changing %s: err = %v, want a validation error", field, err)
-		}
+
+	// storageSize can't change after creation; replicas can (that's scaling).
+	get(t, ns, "defaults", qc)
+	qc.Spec.StorageSize = resource.MustParse("2Gi")
+	if err := k8sClient.Update(ctx, qc); err == nil || !strings.Contains(err.Error(), "storageSize") {
+		t.Errorf("changing storageSize: err = %v, want a validation error", err)
+	}
+	get(t, ns, "defaults", qc)
+	qc.Spec.Replicas = 5
+	if err := k8sClient.Update(ctx, qc); err != nil {
+		t.Errorf("changing replicas: %v, want it allowed", err)
 	}
 
 	// Names longer than 50 characters are rejected.

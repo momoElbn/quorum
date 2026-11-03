@@ -26,13 +26,13 @@ const (
 // collects it from Raft and check decides, so the decision can be tested
 // with any combination of values, without a real cluster.
 type readiness struct {
-	state         raft.RaftState
-	leaderID      string
-	sinceContact  time.Duration // since the last message from the leader; < 0 means never
-	leaderInPeers bool
-	voter         bool
-	commitIndex   uint64
-	appliedIndex  uint64
+	state           raft.RaftState
+	leaderID        string
+	sinceContact    time.Duration // since the last message from the leader; < 0 means never
+	leaderHTTPKnown bool          // false: followers couldn't redirect clients to the leader
+	voter           bool
+	commitIndex     uint64
+	appliedIndex    uint64
 }
 
 // Ready reports whether this node should receive client traffic, which is
@@ -54,8 +54,7 @@ func (s *Store) Ready() error {
 		commitIndex:  s.raft.CommitIndex(),
 		appliedIndex: s.raft.AppliedIndex(),
 	}
-	r.leaderID, _ = s.Leader()
-	_, r.leaderInPeers = s.cfg.Peers[r.leaderID]
+	r.leaderID, _, r.leaderHTTPKnown = s.LeaderHTTPAddr()
 	if last := s.raft.LastContact(); !last.IsZero() {
 		r.sinceContact = time.Since(last)
 	}
@@ -89,8 +88,8 @@ func (r readiness) check() error {
 			return fmt.Errorf("no contact with the leader for %s", r.sinceContact.Round(time.Millisecond))
 		}
 	}
-	if !r.leaderInPeers {
-		return fmt.Errorf("leader %s is not in PEERS_HTTP, so clients can't be redirected to it", r.leaderID)
+	if !r.leaderHTTPKnown {
+		return fmt.Errorf("no HTTP address for leader %s (not in PEERS_HTTP, and none can be derived from its Raft address), so clients can't be redirected to it", r.leaderID)
 	}
 	// A node that hasn't joined yet (or was removed, or is a non-voter)
 	// isn't part of the majority, so it shouldn't count as ready.
