@@ -92,6 +92,11 @@ func ownerRef(qc *quorumv1alpha1.QuorumCluster) *metav1ac.OwnerReferenceApplyCon
 func headlessService(qc *quorumv1alpha1.QuorumCluster) *corev1ac.ServiceApplyConfiguration {
 	return corev1ac.Service(headlessName(qc), qc.Namespace).
 		WithLabels(labels(qc)).
+		// Both Services select the same pods, so they need a label that tells
+		// them apart: the quorum ServiceMonitor scrapes through this one only.
+		// (Scraping through both would collect every metric twice.) This one
+		// also lists pods that aren't ready, so they're still scraped.
+		WithLabels(map[string]string{"app.kubernetes.io/component": "peers"}).
 		WithOwnerReferences(ownerRef(qc)).
 		WithSpec(corev1ac.ServiceSpec().
 			WithClusterIP(corev1.ClusterIPNone).
@@ -110,6 +115,7 @@ func headlessService(qc *quorumv1alpha1.QuorumCluster) *corev1ac.ServiceApplyCon
 func clientService(qc *quorumv1alpha1.QuorumCluster) *corev1ac.ServiceApplyConfiguration {
 	return corev1ac.Service(qc.Name, qc.Namespace).
 		WithLabels(labels(qc)).
+		WithLabels(map[string]string{"app.kubernetes.io/component": "client"}).
 		WithOwnerReferences(ownerRef(qc)).
 		WithSpec(corev1ac.ServiceSpec().
 			WithType(corev1.ServiceTypeClusterIP).

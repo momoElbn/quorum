@@ -170,6 +170,11 @@ func TestReconcileCreatesOwnedObjects(t *testing.T) {
 	var headless corev1.Service
 	get(t, ns, "quorum-headless", &headless)
 	checkOwned(t, &headless, qc)
+	// The ServiceMonitor selects on this label, so it must tell the two
+	// Services apart.
+	if headless.Labels["app.kubernetes.io/component"] != "peers" {
+		t.Errorf("headless component label = %q, want peers", headless.Labels["app.kubernetes.io/component"])
+	}
 	if headless.Spec.ClusterIP != corev1.ClusterIPNone || !headless.Spec.PublishNotReadyAddresses {
 		t.Errorf("headless: clusterIP=%q publishNotReady=%v", headless.Spec.ClusterIP, headless.Spec.PublishNotReadyAddresses)
 	}
@@ -177,6 +182,9 @@ func TestReconcileCreatesOwnedObjects(t *testing.T) {
 	var svc corev1.Service
 	get(t, ns, "quorum", &svc)
 	checkOwned(t, &svc, qc)
+	if svc.Labels["app.kubernetes.io/component"] != "client" {
+		t.Errorf("client service component label = %q, want client", svc.Labels["app.kubernetes.io/component"])
+	}
 	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 8080 {
 		t.Errorf("client service ports = %+v", svc.Spec.Ports)
 	}
