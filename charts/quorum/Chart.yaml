@@ -1,0 +1,8 @@
+apiVersion: v2
+name: quorum
+description: A 3-node Raft-replicated key-value store (quorum-server).
+type: application
+# Chart version: bump it whenever a template changes.
+version: 0.1.0
+# Version of quorum-server this chart is made for.
+appVersion: "0.1.0"

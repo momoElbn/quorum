@@ -68,6 +68,16 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return c, fmt.Errorf("BOOTSTRAP %q: %w", b, err)
 		}
 	}
+	// BOOTSTRAP_NODE names the one node that may bootstrap, e.g. "quorum-0".
+	// It exists for Kubernetes: every pod of a StatefulSet gets the same env,
+	// so we can't set BOOTSTRAP=true on just one of them. Instead, every pod
+	// gets BOOTSTRAP_NODE=quorum-0 and only the pod with that name bootstraps.
+	if bn := getenv("BOOTSTRAP_NODE"); bn != "" {
+		if getenv("BOOTSTRAP") != "" {
+			return c, errors.New("set BOOTSTRAP or BOOTSTRAP_NODE, not both")
+		}
+		c.Bootstrap = bn == c.NodeID
+	}
 
 	// JOIN_ADDR may list several nodes (comma-separated), so a new node can
 	// still join when one of them is down.

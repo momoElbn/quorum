@@ -1,0 +1,16 @@
+# PodDisruptionBudget: at most 1 pod may be down because of a *voluntary*
+# disruption (node drain, cluster upgrade, eviction). Raft needs a majority:
+# with 3 nodes, losing 2 at once stops all writes and reads. The PDB makes
+# `kubectl drain` wait instead of evicting a second pod.
+# It can't prevent crashes or node failures, only planned evictions.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "quorum.fullname" . }}
+  labels:
+    {{- include "quorum.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "quorum.selectorLabels" . | nindent 6 }}

@@ -1,0 +1,33 @@
+# Number of Raft nodes. Keep it odd: 3 survives 1 failure, 5 survives 2.
+# Changing it on a running cluster does not add or remove Raft members by
+# itself (that needs POST /join and /remove). Handling that is the operator's
+# job later.
+replicas: 3
+
+image:
+  # For now the image is built locally and loaded into k3d:
+  #   docker build -t quorum-server:dev . && k3d image import quorum-server:dev -c quorum
+  repository: quorum-server
+  tag: dev
+  # IfNotPresent: use the imported image. With "Always", Kubernetes would try
+  # to pull quorum-server:dev from Docker Hub and fail.
+  pullPolicy: IfNotPresent
+
+httpPort: 8080 # client API, /status, /healthz, /metrics
+raftPort: 7000 # Raft traffic between the pods
+
+# DNS suffix of the cluster, used to build stable peer names like
+# quorum-0.quorum-headless.quorum.svc.cluster.local.
+clusterDomain: cluster.local
+
+storage:
+  size: 1Gi
+  # Empty means the cluster's default StorageClass (local-path on k3d).
+  storageClassName: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
