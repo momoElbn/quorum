@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- quorum_v1alpha1_quorumcluster.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: quorum-operator
+description: Kubernetes operator that runs quorum-server clusters from QuorumCluster resources.
+type: application
+# Chart version: bump it whenever a template or the CRD changes.
+version: 0.1.0
+appVersion: "0.1.0"

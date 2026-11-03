@@ -1,0 +1,9 @@
+apiVersion: quorum.momoelbn.github.io/v1alpha1
+kind: QuorumCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: quorum-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: quorumcluster-sample
+spec:
+  # TODO(user): Add fields here

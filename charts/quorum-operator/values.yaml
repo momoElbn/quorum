@@ -1,0 +1,18 @@
+image:
+  # For now the image is built locally and loaded into k3d, from operator/:
+  #   docker build -t quorum-operator:dev . && k3d image import quorum-operator:dev -c quorum
+  repository: quorum-operator
+  tag: dev
+  # IfNotPresent: use the imported image instead of pulling from Docker Hub.
+  pullPolicy: IfNotPresent
+
+# The cluster's DNS suffix. The operator uses it to build each quorum pod's
+# stable address (quorum-0.quorum-headless.<ns>.svc.<clusterDomain>).
+clusterDomain: cluster.local
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi

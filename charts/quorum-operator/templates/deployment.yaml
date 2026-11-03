@@ -1,0 +1,57 @@
+# The operator itself: one pod running the controller. It is stateless (all
+# state lives in the API server), so a Deployment fits.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "quorum-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "quorum-operator.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "quorum-operator.fullname" . }}
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            # Only one operator pod reconciles at a time (see the Role in
+            # rbac.yaml).
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --cluster-domain={{ .Values.clusterDomain }}
+          ports:
+            - name: probes
+              containerPort: 8081
+          # /healthz and /readyz are served by controller-runtime.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
