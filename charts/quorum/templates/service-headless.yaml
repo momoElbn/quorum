@@ -1,0 +1,27 @@
+# Headless Service (clusterIP: None). It has no virtual IP and doesn't load
+# balance. Its job is DNS: together with the StatefulSet's serviceName, it
+# gives every pod its own stable name, e.g.
+#   quorum-0.quorum-headless.quorum.svc.cluster.local
+# Raft stores these names in its membership list. Pod IPs change on every
+# restart, but these names don't.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quorum.headless" . }}
+  labels:
+    {{- include "quorum.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Publish DNS records even for pods that aren't Ready yet. Raft peers must
+  # reach each other while starting up, for example to elect a leader
+  # before any pod reports Ready. Without this, a cold start could deadlock.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "quorum.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.httpPort }}
+      targetPort: http
+    - name: raft
+      port: {{ .Values.raftPort }}
+      targetPort: raft

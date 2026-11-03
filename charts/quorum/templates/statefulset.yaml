@@ -1,0 +1,143 @@
+# StatefulSet, not Deployment: each Raft node needs
+#   - a stable name (quorum-0, quorum-1, ...), because that is its Raft ID,
+#   - its own disk that follows it across restarts (volumeClaimTemplates),
+#   - a stable DNS name through the headless Service (serviceName).
+# A Deployment gives pods random names and shared or no storage.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "quorum.fullname" . }}
+  labels:
+    {{- include "quorum.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  serviceName: {{ include "quorum.headless" . }}
+  # Start and stop all pods at the same time, instead of one by one waiting
+  # for each to become Ready. Raft nodes need each other to elect a leader,
+  # so waiting in order only slows startup. Rolling updates still replace
+  # one pod at a time.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "quorum.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "quorum.labels" . | nindent 8 }}
+    spec:
+      # Matches the server's own shutdown budget: on SIGTERM it drains HTTP
+      # (up to 10s), hands leadership to another pod, then closes Raft.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Makes the mounted volume writable for that user.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Prefer one pod per node. If a node dies, we lose only 1 of 3 Raft
+        # members and keep a majority. "Preferred", not "required", so it
+        # still schedules on a cluster with fewer nodes.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "quorum.selectorLabels" . | nindent 20 }}
+      containers:
+        - name: quorum-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.httpPort }}
+            - name: raft
+              containerPort: {{ .Values.raftPort }}
+          env:
+            # The downward API hands the pod its own name and namespace.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # $(VAR) uses variables defined above in this list.
+            # The pod name (quorum-0, ...) is stable, so it works as Raft ID.
+            - name: NODE_ID
+              value: "$(POD_NAME)"
+            # The address other pods dial. It is stored in the Raft
+            # membership, so it must be the stable DNS name, not the pod IP.
+            - name: RAFT_ADDR
+              value: "$(POD_NAME).{{ include "quorum.headless" . }}.$(POD_NAMESPACE).svc.{{ .Values.clusterDomain }}:{{ .Values.raftPort }}"
+            - name: HTTP_ADDR
+              value: ":{{ .Values.httpPort }}"
+            - name: DATA_DIR
+              value: /data
+            # Only pod 0 creates the cluster, and only when its disk is empty.
+            # Every pod gets the same value; the server compares it to NODE_ID.
+            - name: BOOTSTRAP_NODE
+              value: {{ include "quorum.fullname" . }}-0
+            # The others join through pod 0. Pod 0 ignores this, because after
+            # bootstrapping it is already a member. If pod 0 isn't the leader
+            # any more, it redirects the join to the leader.
+            - name: JOIN_ADDR
+              value: "{{ include "quorum.podHost" (list . 0) }}:{{ .Values.httpPort }}"
+            # Node ID -> HTTP address, used to redirect clients to the leader.
+            # These are in-cluster DNS names, so clients inside the cluster can
+            # follow the redirects.
+            - name: PEERS_HTTP
+              value: "{{- range $i := until (int .Values.replicas) }}{{ if $i }},{{ end }}{{ include "quorum.fullname" $ }}-{{ $i }}={{ include "quorum.podHost" (list $ $i) }}:{{ $.Values.httpPort }}{{- end }}"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # /healthz answers 200 while the process and Raft are running. It
+          # deliberately doesn't check for a leader: during a network split,
+          # failing liveness would restart every pod and make recovery slower.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness controls whether the client Service sends traffic here.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # All writes go to /data, so the rest of the filesystem can be
+            # read-only.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  # One PersistentVolumeClaim per pod (data-quorum-0, data-quorum-1, ...).
+  # The claim stays bound to its pod across restarts and rescheduling, so a
+  # node comes back with its own Raft log, vote and snapshots. Deleting the
+  # StatefulSet does not delete the claims: losing Raft data must be a
+  # deliberate decision.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "quorum.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

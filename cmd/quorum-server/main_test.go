@@ -46,6 +46,23 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfigBootstrapNode(t *testing.T) {
+	for id, want := range map[string]bool{"quorum-0": true, "quorum-1": false} {
+		cfg, err := loadConfig(fakeEnv(map[string]string{
+			"NODE_ID":        id,
+			"RAFT_ADDR":      id + ".quorum-headless:7000",
+			"DATA_DIR":       "/data",
+			"BOOTSTRAP_NODE": "quorum-0",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Bootstrap != want {
+			t.Errorf("%s: Bootstrap = %v, want %v", id, cfg.Bootstrap, want)
+		}
+	}
+}
+
 func TestLoadConfigErrors(t *testing.T) {
 	cases := map[string]map[string]string{
 		"missing NODE_ID":        {"RAFT_ADDR": "n:7000", "DATA_DIR": "/d"},
@@ -53,6 +70,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		"bad BOOTSTRAP":          {"NODE_ID": "n", "RAFT_ADDR": "n:7000", "DATA_DIR": "/d", "BOOTSTRAP": "maybe"},
 		"PEERS_HTTP without =":   {"NODE_ID": "n", "RAFT_ADDR": "n:7000", "DATA_DIR": "/d", "PEERS_HTTP": "node1"},
 		"PEERS_HTTP empty addr":  {"NODE_ID": "n", "RAFT_ADDR": "n:7000", "DATA_DIR": "/d", "PEERS_HTTP": "node1="},
+		"both bootstrap vars":    {"NODE_ID": "n", "RAFT_ADDR": "n:7000", "DATA_DIR": "/d", "BOOTSTRAP": "true", "BOOTSTRAP_NODE": "n"},
 	}
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -52,6 +52,9 @@ speed yet.
 
 - One node starts with `BOOTSTRAP=true`. If it has no Raft state on disk, it
   creates a one-member cluster containing only itself.
+  In Kubernetes, all pods of a StatefulSet share one env, so the chart sets
+  `BOOTSTRAP_NODE=quorum-0` instead. Only the node whose `NODE_ID` matches
+  bootstraps.
 - The other nodes start with `JOIN_ADDR` set. Each one calls `POST /join`
   with its node ID and Raft address, retrying with exponential backoff
   (0.5s, doubling up to 10s) until it succeeds. A follower redirects the join

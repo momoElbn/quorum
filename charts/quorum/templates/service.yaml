@@ -1,0 +1,18 @@
+# Client Service: one stable virtual IP and name ("quorum") that spreads
+# client requests over the Ready pods. Any pod can take a request: followers
+# answer 307 with the leader's address, so clients only need this one name.
+# Only the HTTP port is exposed. Raft traffic stays on the headless Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "quorum.fullname" . }}
+  labels:
+    {{- include "quorum.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "quorum.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.httpPort }}
+      targetPort: http
