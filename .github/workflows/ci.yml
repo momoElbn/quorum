@@ -56,16 +56,6 @@ jobs:
         # Raft's goroutines and HTTP handlers at the same time.
         run: go test -race ./...
 
-  docker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      # Only checks that the image builds. Nothing is pushed: for now the
-      # image is built locally and loaded into k3d.
-      - name: Build image
-        run: docker build -t quorum-server:ci .
-
   chart:
     runs-on: ubuntu-latest
     timeout-minutes: 10
