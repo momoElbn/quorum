@@ -1,5 +1,18 @@
-# CI: runs on every pull request into main, and again after a merge into
-# main, so main is always known to build and pass its tests.
+# CI/CD pipeline.
+#
+# On a pull request into main:
+#   test, operator, chart  -> must pass
+#   images                 -> built, not pushed (proves they still build)
+#
+# On a push to main (a merged PR):
+#   test, operator, chart  -> must pass
+#   images                 -> built and pushed to GHCR, tagged with the
+#                             commit SHA
+#   deploy                 -> commits the new tag into quorum-gitops; Argo CD
+#                             then rolls it out
+#
+# Every job after the tests "needs" the tests, so nothing broken is ever
+# pushed or deployed.
 name: CI
 
 on:
@@ -8,12 +21,13 @@ on:
   push:
     branches: [main]
 
-# The job only reads the code, so give the token read-only access.
+# Default for every job: read the code, nothing else. Jobs that need more
+# ask for it themselves.
 permissions:
   contents: read
 
-# If you push again to a PR while CI is still running, cancel the old run:
-# only the result for the newest commit matters.
+# A newer push to the same PR or branch cancels the older run: only the
+# result for the newest commit matters.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -56,6 +70,33 @@ jobs:
         # Raft's goroutines and HTTP handlers at the same time.
         run: go test -race ./...
 
+  operator:
+    # operator/ is its own Go module, so the job above doesn't cover it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      - name: Vet and test with envtest (-race)
+        # make test regenerates the CRD, RBAC and deepcopy code, runs go fmt
+        # and go vet, downloads the envtest binaries (a real kube-apiserver
+        # and etcd), then runs go test -race.
+        run: make test
+
+      - name: Check generated files are committed
+        # make test regenerated code and copied the CRD and RBAC rules into
+        # charts/quorum-operator. Any difference means someone changed the
+        # Go types or RBAC markers without running `make manifests generate`.
+        run: git diff --exit-code
+
   chart:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -95,3 +136,116 @@ jobs:
             echo "::endgroup::"
           done
           [ "$found" = 1 ] || echo "No charts found, nothing to check."
+
+  images:
+    needs: [test, operator, chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Pushing to GHCR needs packages: write. GITHUB_TOKEN gets it only in
+    # this job, and pull requests never log in or push.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false # one broken image shouldn't cancel the other's build
+      matrix:
+        include:
+          - name: quorum-server # also contains quorum-checker
+            context: .
+          - name: quorum-operator
+            context: operator
+    steps:
+      - uses: actions/checkout@v7
+
+      # Buildx is Docker's builder. We need it for the build cache below.
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The workflow's own short-lived token: nothing to create.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, and push on main
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64 # the k3d nodes and runners are amd64
+          push: ${{ github.event_name == 'push' }}
+          # One immutable tag: the full commit SHA. The image always matches
+          # exactly one commit, and a new commit always means a new tag, so
+          # Argo CD and the nodes can see that something changed.
+          # Registry paths must be lower case: "momoelbn", not "momoElbn".
+          tags: ghcr.io/momoelbn/${{ matrix.name }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Reuse layers from earlier runs (e.g. Go module downloads), kept
+          # in GitHub Actions' cache, one cache per image.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  deploy:
+    needs: images
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Deploys run one at a time, in order, so an older run can't overwrite
+    # a newer tag.
+    concurrency:
+      group: gitops-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Check out quorum-gitops
+        uses: actions/checkout@v7
+        with:
+          repository: momoElbn/quorum-gitops
+          ref: main
+          # GITHUB_TOKEN can only write to *this* repo. Pushing to
+          # quorum-gitops needs its own credential: a deploy key with write
+          # access to quorum-gitops, whose private half is stored in this
+          # repo's secrets. checkout configures git to use it for the push.
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+
+      - name: Point quorum-gitops at the new images
+        env:
+          SHA: ${{ github.sha }}
+        # yq (preinstalled on GitHub's runners) edits YAML without
+        # rewriting the rest of the file. Three fields change:
+        #   - the quorum-server image in the QuorumCluster
+        #   - the operator chart's Git revision (pinned to this commit, so the
+        #     chart, CRD and operator image always come from the same commit)
+        #   - the operator image, passed to the chart as a Helm value
+        run: |
+          yq -i '.spec.image = "ghcr.io/momoelbn/quorum-server:" + strenv(SHA)' quorum/quorumcluster.yaml
+          yq -i '
+            .spec.source.targetRevision = strenv(SHA) |
+            .spec.source.helm.valuesObject.image.repository = "ghcr.io/momoelbn/quorum-operator" |
+            .spec.source.helm.valuesObject.image.tag = strenv(SHA)
+          ' apps/quorum-operator.yaml
+          git diff
+
+      - name: Commit and push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          if git diff --quiet; then
+            echo "quorum-gitops already points at ${SHA}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "(deploy): quorum ${SHA::7}"
+          # If someone pushed to quorum-gitops in the meantime, rebase onto
+          # their commit and try again.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git pull --rebase origin main
+          done
+          echo "could not push to quorum-gitops" >&2
+          exit 1
