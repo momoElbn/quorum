@@ -15,9 +15,12 @@
 # MODE=kill crashes the leader: SIGKILL straight to the quorum-server
 # process, with no SIGTERM and no handoff, like a kernel OOM kill or a power
 # cut. The others have to notice the missing heartbeats and elect a new
-# leader, so expect a second or two without writes. Kubernetes then restarts
-# the container in the same pod. This reaches into the k3d node container
-# with `docker exec`, so it only works on k3d.
+# leader, so expect a second or two without writes. The dead pod is then
+# replaced by a fresh one (see crash below). This reaches into the k3d node
+# container with `docker exec`, so it only works on k3d.
+#
+# Both modes wait until every pod is Ready before taking the next leader
+# down, so each round tests exactly one failure.
 # (Even `kubectl delete --grace-period=0 --force` isn't a crash: the kubelet
 # still sends SIGTERM before killing the container.)
 #
@@ -66,13 +69,40 @@ crash() {
 		--label "io.kubernetes.pod.name=$pod" --label "io.kubernetes.pod.namespace=$NS")
 	pid=$(docker exec "$node" crictl inspect --output go-template --template '{{.info.pid}}' "$cid")
 	docker exec "$node" kill -9 "$pid"
+	# Then replace the pod instead of letting the kubelet restart the crashed
+	# container in place. The kubelet waits longer after each crash of the
+	# same container (CrashLoopBackOff: 10s, 20s, 40s... up to 5 min), so
+	# after a few rounds a killed pod would still be down at the next kill:
+	# two of three nodes gone, which is a different experiment. A new pod
+	# starts without that history. The process is already dead, so this
+	# delete can't trigger a graceful handoff.
+	kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null
+}
+
+# wait_healthy waits until every pod of the cluster is Ready and prints how
+# many seconds that took. Each kill should hit a healthy cluster, so every
+# measured outage is one leader dying, not two failures piling up.
+wait_healthy() {
+	local want ready waited=0
+	want=$(kubectl -n "$NS" get statefulset "$CLUSTER" -o jsonpath='{.spec.replicas}')
+	while true; do
+		ready=$(kubectl -n "$NS" get statefulset "$CLUSTER" -o jsonpath='{.status.readyReplicas}')
+		[ "${ready:-0}" = "$want" ] && break
+		sleep 1
+		waited=$((waited + 1))
+	done
+	echo "$waited"
 }
 
 echo "taking down the leader of $NS/$CLUSTER every ${INTERVAL}s (mode: $MODE, count: ${COUNT/#0/unlimited})"
 done_count=0
 while [ "$COUNT" -eq 0 ] || [ "$done_count" -lt "$COUNT" ]; do
 	sleep "$INTERVAL"
-	ts=$(date +%H:%M:%S)
+	waited=$(wait_healthy)
+	if [ "$waited" -gt 0 ]; then
+		echo "$(date -u +%H:%M:%S)  waited ${waited}s for all pods to be ready"
+	fi
+	ts=$(date -u +%H:%M:%S)
 	if ! leader=$(find_leader); then
 		# Probably still electing after the last round. Try next time.
 		echo "$ts  no leader found, skipping this round"
