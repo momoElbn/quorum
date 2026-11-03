@@ -11,13 +11,13 @@ import (
 func TestReadinessCheck(t *testing.T) {
 	// A healthy follower; each case changes one thing.
 	ok := readiness{
-		state:         raft.Follower,
-		leaderID:      "node0",
-		sinceContact:  100 * time.Millisecond,
-		leaderInPeers: true,
-		voter:         true,
-		commitIndex:   500,
-		appliedIndex:  450,
+		state:           raft.Follower,
+		leaderID:        "node0",
+		sinceContact:    100 * time.Millisecond,
+		leaderHTTPKnown: true,
+		voter:           true,
+		commitIndex:     500,
+		appliedIndex:    450,
 	}
 	cases := []struct {
 		name    string
@@ -32,7 +32,7 @@ func TestReadinessCheck(t *testing.T) {
 		{"no leader", func(r *readiness) { r.leaderID = "" }, "no leader known"},
 		{"never heard from leader", func(r *readiness) { r.sinceContact = -1 }, "no contact with the leader yet"},
 		{"leader silent too long", func(r *readiness) { r.sinceContact = maxLeaderSilence }, "no contact with the leader for 3s"},
-		{"leader not in PEERS_HTTP", func(r *readiness) { r.leaderInPeers = false }, "leader node0 is not in PEERS_HTTP"},
+		{"no HTTP address for the leader", func(r *readiness) { r.leaderHTTPKnown = false }, "no HTTP address for leader node0"},
 		{"not a voter", func(r *readiness) { r.voter = false }, "not a voter"},
 		{"too far behind", func(r *readiness) { r.appliedIndex = r.commitIndex - maxApplyLag - 1 }, "101 entries behind"},
 	}

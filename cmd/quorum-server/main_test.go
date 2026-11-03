@@ -145,7 +145,7 @@ func startCluster(t *testing.T) []*node {
 		nodes = append(nodes, n)
 	}
 	for _, n := range nodes {
-		n.http.Config.Handler = newHandler(n.store, peers, prometheus.NewRegistry())
+		n.http.Config.Handler = newHandler(n.store, prometheus.NewRegistry())
 		n.http.Start()
 		t.Cleanup(n.http.Close)
 	}
@@ -268,7 +268,7 @@ func TestReadyzReportsReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(newHandler(st, map[string]string{}, prometheus.NewRegistry()))
+	srv := httptest.NewServer(newHandler(st, prometheus.NewRegistry()))
 	t.Cleanup(srv.Close)
 
 	if resp, body := do(t, http.DefaultClient, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "no leader known") {
@@ -277,5 +277,67 @@ func TestReadyzReportsReason(t *testing.T) {
 	// Liveness doesn't care about the leader.
 	if resp, _ := do(t, http.DefaultClient, http.MethodGet, srv.URL+"/healthz", ""); resp.StatusCode != http.StatusOK {
 		t.Errorf("/healthz: status %d, want 200", resp.StatusCode)
+	}
+}
+
+// The operator's membership calls, over HTTP and through a follower: join a
+// node as a nonvoter, promote it, and hand leadership to another node.
+func TestMembershipEndpoints(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a 3-node cluster")
+	}
+	nodes := startCluster(t)
+	leader := waitForLeader(t, nodes)
+	var follower *node
+	for _, n := range nodes {
+		if n != leader {
+			follower = n
+			break
+		}
+	}
+
+	extra := store.New(store.Config{NodeID: "node3", RaftBind: "127.0.0.1:0", DataDir: t.TempDir(), LogOutput: io.Discard})
+	if err := extra.Open(false); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { extra.Close() })
+	voter := func() (member, voter bool) {
+		st, err := leader.store.Status()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range st.Members {
+			if m.ID == "node3" {
+				return true, m.Voter
+			}
+		}
+		return false, false
+	}
+
+	join := fmt.Sprintf(`{"id":"node3","raft_addr":%q,"nonvoter":true}`, extra.RaftAddr())
+	if resp, body := do(t, http.DefaultClient, http.MethodPost, "http://"+follower.addr+"/join", join); resp.StatusCode != http.StatusOK {
+		t.Fatalf("join as nonvoter: %d %s", resp.StatusCode, body)
+	}
+	if m, v := voter(); !m || v {
+		t.Fatalf("after nonvoter join: member=%v voter=%v", m, v)
+	}
+	join = fmt.Sprintf(`{"id":"node3","raft_addr":%q}`, extra.RaftAddr())
+	if resp, body := do(t, http.DefaultClient, http.MethodPost, "http://"+follower.addr+"/join", join); resp.StatusCode != http.StatusOK {
+		t.Fatalf("promote: %d %s", resp.StatusCode, body)
+	}
+	if m, v := voter(); !m || !v {
+		t.Fatalf("after voter join: member=%v voter=%v", m, v)
+	}
+
+	// Sent to a follower, it's redirected to the leader, which hands over.
+	if resp, body := do(t, http.DefaultClient, http.MethodPost, "http://"+follower.addr+"/transfer-leadership", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("transfer-leadership: %d %s", resp.StatusCode, body)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for leader.store.State() == "leader" {
+		if time.Now().After(deadline) {
+			t.Fatal("old leader is still the leader")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

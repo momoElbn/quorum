@@ -19,14 +19,13 @@ const maxBody = 1 << 20 // 1 MiB
 
 type server struct {
 	store   *store.Store
-	peers   map[string]string // node ID -> HTTP address, from PEERS_HTTP
 	metrics *metrics
 }
 
 // newHandler wires the routes. It is separate from main so tests can run it
 // with httptest.
-func newHandler(st *store.Store, peers map[string]string, reg *prometheus.Registry) http.Handler {
-	s := &server{store: st, peers: peers, metrics: newMetrics(reg, st)}
+func newHandler(st *store.Store, reg *prometheus.Registry) http.Handler {
+	s := &server{store: st, metrics: newMetrics(reg, st)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /kv/{key}", s.handlePut)
@@ -34,6 +33,7 @@ func newHandler(st *store.Store, peers map[string]string, reg *prometheus.Regist
 	mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
 	mux.HandleFunc("POST /join", s.handleJoin)
 	mux.HandleFunc("POST /remove", s.handleRemove)
+	mux.HandleFunc("POST /transfer-leadership", s.handleTransferLeadership)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -99,7 +99,7 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request) {
 // We use 307, not 302: with 302, many clients turn PUT into GET and drop
 // the body. 307 requires the client to repeat the same method and body.
 func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) {
-	leaderID, _ := s.store.Leader()
+	leaderID, addr, ok := s.store.LeaderHTTPAddr()
 	if leaderID == "" {
 		// An election is in progress. It usually finishes within a couple
 		// of seconds, so ask the client to retry shortly.
@@ -107,11 +107,10 @@ func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no leader elected yet", http.StatusServiceUnavailable)
 		return
 	}
-	// Raft only knows the leader's Raft address. PEERS_HTTP tells us where
-	// its HTTP server is.
-	addr, ok := s.peers[leaderID]
+	// Raft only knows the leader's Raft address. The store works out its
+	// HTTP address from PEERS_HTTP or from the Raft address's host.
 	if !ok {
-		http.Error(w, "leader "+leaderID+" is not in PEERS_HTTP", http.StatusServiceUnavailable)
+		http.Error(w, "no HTTP address for leader "+leaderID, http.StatusServiceUnavailable)
 		return
 	}
 	http.Redirect(w, r, "http://"+addr+r.URL.RequestURI(), http.StatusTemporaryRedirect)
@@ -120,6 +119,10 @@ func (s *server) redirectToLeader(w http.ResponseWriter, r *http.Request) {
 type joinRequest struct {
 	ID       string `json:"id"`
 	RaftAddr string `json:"raft_addr"`
+	// Nonvoter adds the node without a vote, so it can catch up on the log
+	// before it counts towards the majority. Joining again without it
+	// promotes the node to voter.
+	Nonvoter bool `json:"nonvoter,omitempty"`
 }
 
 func (s *server) handleJoin(w http.ResponseWriter, r *http.Request) {
@@ -130,8 +133,11 @@ func (s *server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only the leader can change membership, so followers redirect.
 	// The joining node's HTTP client follows the 307 automatically.
-	err := s.store.Join(req.ID, req.RaftAddr)
-	s.finishMembership(w, r, err, "join "+req.ID)
+	join, what := s.store.Join, "join "+req.ID
+	if req.Nonvoter {
+		join, what = s.store.JoinNonvoter, "join "+req.ID+" as nonvoter"
+	}
+	s.finishMembership(w, r, join(req.ID, req.RaftAddr), what)
 }
 
 type removeRequest struct {
@@ -146,6 +152,17 @@ func (s *server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.store.Remove(req.ID)
 	s.finishMembership(w, r, err, "remove "+req.ID)
+}
+
+// handleTransferLeadership hands leadership to another voter. The operator
+// calls it before removing the leader from the cluster, so that writes don't
+// stop for an election timeout. Followers redirect to the leader.
+func (s *server) handleTransferLeadership(w http.ResponseWriter, r *http.Request) {
+	if s.store.State() != "leader" {
+		s.redirectToLeader(w, r)
+		return
+	}
+	s.finishMembership(w, r, s.store.TransferLeadership(), "transfer leadership")
 }
 
 func (s *server) finishMembership(w http.ResponseWriter, r *http.Request, err error, what string) {

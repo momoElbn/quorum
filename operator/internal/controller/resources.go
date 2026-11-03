@@ -12,7 +12,6 @@ package controller
 
 import (
 	"fmt"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,10 +45,15 @@ func podName(qc *quorumv1alpha1.QuorumCluster, i int32) string {
 	return fmt.Sprintf("%s-%d", qc.Name, i)
 }
 
+// podHostByName is the stable DNS name of the pod called name.
+func podHostByName(qc *quorumv1alpha1.QuorumCluster, name, clusterDomain string) string {
+	return fmt.Sprintf("%s.%s.%s.svc.%s", name, headlessName(qc), qc.Namespace, clusterDomain)
+}
+
 // podHost is pod i's stable DNS name, e.g.
 // quorum-0.quorum-headless.quorum.svc.cluster.local.
 func podHost(qc *quorumv1alpha1.QuorumCluster, i int32, clusterDomain string) string {
-	return fmt.Sprintf("%s.%s.%s.svc.%s", podName(qc, i), headlessName(qc), qc.Namespace, clusterDomain)
+	return podHostByName(qc, podName(qc, i), clusterDomain)
 }
 
 // selectorLabels find this cluster's pods. They must never change: a
@@ -150,11 +154,48 @@ func podDisruptionBudget(qc *quorumv1alpha1.QuorumCluster) *policyv1ac.PodDisrup
 // statefulSet runs the Raft nodes. A StatefulSet gives each pod a stable name
 // (its Raft ID), a stable DNS name (through the headless Service) and its own
 // volume that follows it across restarts.
-func statefulSet(qc *quorumv1alpha1.QuorumCluster, clusterDomain string) *appsv1ac.StatefulSetApplyConfiguration {
-	// Node ID -> HTTP address, for redirecting clients to the leader.
-	peers := make([]string, 0, qc.Spec.Replicas)
-	for i := int32(0); i < qc.Spec.Replicas; i++ {
-		peers = append(peers, fmt.Sprintf("%s=%s:%d", podName(qc, i), podHost(qc, i, clusterDomain), httpPort))
+//
+// replicas is how many pods to run. In safe scaling mode the operator moves
+// it one at a time towards spec.replicas; see planScale.
+//
+// Nothing in the pod template may depend on the replica count. Changing the
+// template restarts every pod (a rolling update), and a scale operation
+// must not do that: it would cost a leader election per pod in the middle
+// of a membership change. That's why there is no PEERS_HTTP (it would list
+// every pod): the server works out the leader's HTTP address from its Raft
+// address instead.
+func statefulSet(qc *quorumv1alpha1.QuorumCluster, clusterDomain string, replicas int32) *appsv1ac.StatefulSetApplyConfiguration {
+	envs := []*corev1ac.EnvVarApplyConfiguration{
+		// The downward API hands the pod its own name and namespace.
+		fieldEnv("POD_NAME", "metadata.name"),
+		fieldEnv("POD_NAMESPACE", "metadata.namespace"),
+		// The pod name (quorum-0, ...) is stable, so it is the Raft ID.
+		env("NODE_ID", "$(POD_NAME)"),
+		// The stable DNS name other pods dial. Raft stores it in the
+		// membership, so it must not be the pod IP.
+		env("RAFT_ADDR", fmt.Sprintf("$(POD_NAME).%s.$(POD_NAMESPACE).svc.%s:%d", headlessName(qc), clusterDomain, raftPort)),
+		env("HTTP_ADDR", fmt.Sprintf(":%d", httpPort)),
+		env("DATA_DIR", dataDir),
+		// Only pod 0 creates the cluster, and only if its volume is empty.
+		env("BOOTSTRAP_NODE", podName(qc, 0)),
+	}
+	if qc.Spec.UnsafeScaling {
+		// The naive way: every pod joins by itself, through pod 0, which
+		// redirects the join to the leader. In safe mode there's no
+		// JOIN_ADDR: the operator adds each pod, as a nonvoter first.
+		envs = append(envs, env("JOIN_ADDR", fmt.Sprintf("%s:%d", podHost(qc, 0, clusterDomain), httpPort)))
+	}
+
+	// When the StatefulSet shrinks, delete the removed pod's volume. In
+	// safe mode the member was already removed from Raft; if its old log
+	// survived, scaling up again would bring back a node that still
+	// believes in an old configuration. A fresh volume makes it join as a
+	// brand-new node. Unsafe mode keeps Kubernetes' default (Retain), as
+	// the naive baseline. Deleting the QuorumCluster keeps the volumes
+	// either way: losing Raft data must be deliberate.
+	whenScaled := appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	if !qc.Spec.UnsafeScaling {
+		whenScaled = appsv1.DeletePersistentVolumeClaimRetentionPolicyType
 	}
 
 	container := corev1ac.Container().
@@ -167,24 +208,7 @@ func statefulSet(qc *quorumv1alpha1.QuorumCluster, clusterDomain string) *appsv1
 			corev1ac.ContainerPort().WithName("http").WithContainerPort(httpPort).WithProtocol(corev1.ProtocolTCP),
 			corev1ac.ContainerPort().WithName("raft").WithContainerPort(raftPort).WithProtocol(corev1.ProtocolTCP),
 		).
-		WithEnv(
-			// The downward API hands the pod its own name and namespace.
-			fieldEnv("POD_NAME", "metadata.name"),
-			fieldEnv("POD_NAMESPACE", "metadata.namespace"),
-			// The pod name (quorum-0, ...) is stable, so it is the Raft ID.
-			env("NODE_ID", "$(POD_NAME)"),
-			// The stable DNS name other pods dial. Raft stores it in the
-			// membership, so it must not be the pod IP.
-			env("RAFT_ADDR", fmt.Sprintf("$(POD_NAME).%s.$(POD_NAMESPACE).svc.%s:%d", headlessName(qc), clusterDomain, raftPort)),
-			env("HTTP_ADDR", fmt.Sprintf(":%d", httpPort)),
-			env("DATA_DIR", dataDir),
-			// Only pod 0 creates the cluster, and only if its volume is empty.
-			env("BOOTSTRAP_NODE", podName(qc, 0)),
-			// The other pods join through pod 0. It redirects the join to the
-			// leader if it isn't the leader any more.
-			env("JOIN_ADDR", fmt.Sprintf("%s:%d", podHost(qc, 0, clusterDomain), httpPort)),
-			env("PEERS_HTTP", strings.Join(peers, ",")),
-		).
+		WithEnv(envs...).
 		WithVolumeMounts(corev1ac.VolumeMount().WithName("data").WithMountPath(dataDir)).
 		// Liveness: /healthz doesn't check for a leader. Failing liveness
 		// during a network split would restart every pod and slow down
@@ -246,8 +270,11 @@ func statefulSet(qc *quorumv1alpha1.QuorumCluster, clusterDomain string) *appsv1
 		WithLabels(labels(qc)).
 		WithOwnerReferences(ownerRef(qc)).
 		WithSpec(appsv1ac.StatefulSetSpec().
-			WithReplicas(qc.Spec.Replicas).
+			WithReplicas(replicas).
 			WithServiceName(headlessName(qc)).
+			WithPersistentVolumeClaimRetentionPolicy(appsv1ac.StatefulSetPersistentVolumeClaimRetentionPolicy().
+				WithWhenScaled(whenScaled).
+				WithWhenDeleted(appsv1.RetainPersistentVolumeClaimRetentionPolicyType)).
 			// Start all pods at once: Raft nodes need each other to elect a
 			// leader, so starting them one by one only slows things down.
 			// Rolling updates still replace one pod at a time.

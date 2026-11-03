@@ -29,6 +29,7 @@ import (
 type config struct {
 	NodeID    string
 	HTTPAddr  string            // where to listen for HTTP, e.g. ":8080"
+	HTTPPort  string            // the port part of HTTPAddr
 	RaftAddr  string            // advertised Raft address, e.g. "node1:7000"
 	RaftBind  string            // where to listen for Raft, e.g. ":7000"
 	DataDir   string            // Raft log, stable store and snapshots
@@ -52,6 +53,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if c.HTTPAddr == "" {
 		c.HTTPAddr = ":8080"
+	}
+	var err error
+	if _, c.HTTPPort, err = net.SplitHostPort(c.HTTPAddr); err != nil {
+		return c, fmt.Errorf("HTTP_ADDR %q: %w", c.HTTPAddr, err)
 	}
 
 	// RAFT_ADDR is the name other nodes dial (node1:7000), and it might not
@@ -87,7 +92,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 	}
 
-	// PEERS_HTTP looks like "node1=node1:8080,node2=node2:8080".
+	// PEERS_HTTP looks like "node1=node1:8080,node2=node2:8080". It's
+	// optional: a leader that isn't listed is reached on the host of its
+	// Raft address, on this node's HTTP port (see store.Config.HTTPPort).
 	for _, p := range strings.Split(getenv("PEERS_HTTP"), ",") {
 		if p = strings.TrimSpace(p); p == "" {
 			continue
@@ -113,6 +120,7 @@ func main() {
 		RaftBind: cfg.RaftBind,
 		DataDir:  cfg.DataDir,
 		Peers:    cfg.Peers,
+		HTTPPort: cfg.HTTPPort,
 	})
 	if err := st.Open(cfg.Bootstrap); err != nil {
 		log.Fatal(err)
@@ -120,7 +128,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           newHandler(st, cfg.Peers, prometheus.NewRegistry()),
+		Handler:           newHandler(st, prometheus.NewRegistry()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -20,9 +20,15 @@ spec:
     - jsonPath: .spec.replicas
       name: Replicas
       type: integer
+    - jsonPath: .status.replicas
+      name: Current
+      type: integer
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
+    - jsonPath: .status.scaling.step
+      name: Scaling
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -74,18 +80,11 @@ spec:
                   Replicas is the number of Raft nodes. Use an odd number: 3 nodes
                   survive 1 failure, 5 survive 2.
 
-                  It can't be changed after creation yet: adding or removing nodes
-                  also needs Raft membership changes (POST /join and /remove), which
-                  the operator doesn't do yet. The rule below makes the API server
-                  reject the change, instead of leaving Raft with members that no
-                  longer exist.
+                  Changing it scales the cluster. By default the operator does it
+                  safely, one Raft member at a time (see UnsafeScaling).
                 format: int32
                 minimum: 1
                 type: integer
-                x-kubernetes-validations:
-                - message: replicas can't be changed yet (Raft membership changes
-                    aren't automated)
-                  rule: self == oldSelf
               storageSize:
                 anyOf:
                 - type: integer
@@ -102,6 +101,18 @@ spec:
                 x-kubernetes-validations:
                 - message: storageSize can't be changed after creation
                   rule: self == oldSelf
+              unsafeScaling:
+                default: false
+                description: |-
+                  UnsafeScaling turns off the operator's membership management. Pods
+                  join the cluster by themselves when they start (JOIN_ADDR), the
+                  StatefulSet is set to Replicas directly, and nothing is ever removed
+                  from Raft. Scaling down this way leaves dead voters in the
+                  configuration, which still count towards the majority. It exists as
+                  a baseline to measure safe scaling against; don't use it otherwise.
+
+                  Changing it changes the pod template, so every pod restarts.
+                type: boolean
             required:
             - image
             - replicas
@@ -208,6 +219,38 @@ spec:
                   probe.
                 format: int32
                 type: integer
+              replicas:
+                description: |-
+                  Replicas is the number of pods the StatefulSet currently runs. While
+                  scaling safely, it moves towards spec.replicas one at a time.
+                format: int32
+                type: integer
+              scaling:
+                description: Scaling is the progress of the current scale operation.
+                properties:
+                  member:
+                    description: Member is the pod the step is about, e.g. "quorum-3".
+                    type: string
+                  since:
+                    description: |-
+                      Since is when this step (for this member) started. A step that
+                      doesn't finish within 5 minutes marks the cluster Stuck.
+                    format: date-time
+                    type: string
+                  step:
+                    description: Step is the current step.
+                    enum:
+                    - Idle
+                    - AddingPod
+                    - CatchingUp
+                    - Promoting
+                    - TransferringLeadership
+                    - Removing
+                    - ShrinkingPods
+                    type: string
+                required:
+                - step
+                type: object
             type: object
         required:
         - spec

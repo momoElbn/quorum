@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -184,5 +185,101 @@ func TestRestartKeepsDataAndSkipsBootstrap(t *testing.T) {
 	v, ok, err := s2.Get("k")
 	if err != nil || !ok || v != "v" {
 		t.Fatalf("Get after restart = %q, %v, %v; want \"v\", true, nil", v, ok, err)
+	}
+}
+
+// suffrage returns whether id is in the leader's configuration and whether
+// it votes.
+func suffrage(t *testing.T, leader *Store, id string) (member, voter bool) {
+	t.Helper()
+	st, err := leader.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range st.Members {
+		if m.ID == id {
+			return true, m.Voter
+		}
+	}
+	return false, false
+}
+
+// A node joins as a nonvoter, catches up, and is then promoted by a normal
+// (voter) join. Neither step may happen twice or go backwards.
+func TestJoinNonvoterThenPromote(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a 3-node cluster")
+	}
+	nodes := newCluster(t, 2) // node0 and node1, both voters
+	leader := waitForLeader(t, nodes)
+	if err := leader.Set("k", "v"); err != nil {
+		t.Fatal(err)
+	}
+
+	n2 := openStore(t, "node2", t.TempDir(), "", false)
+	if err := leader.JoinNonvoter("node2", n2.RaftAddr()); err != nil {
+		t.Fatalf("join as nonvoter: %v", err)
+	}
+	if member, voter := suffrage(t, leader, "node2"); !member || voter {
+		t.Fatalf("after JoinNonvoter: member=%v voter=%v, want member, not voter", member, voter)
+	}
+	// Repeating it changes nothing.
+	if err := leader.JoinNonvoter("node2", n2.RaftAddr()); err != nil {
+		t.Fatalf("repeat JoinNonvoter: %v", err)
+	}
+
+	// A nonvoter gets the log but must not report ready: it isn't part of
+	// the majority.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := n2.Ready()
+		if err != nil && strings.Contains(err.Error(), "not a voter") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("nonvoter Ready() = %v, want \"not a voter\"", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Joining as a voter promotes it in place.
+	if err := leader.Join("node2", n2.RaftAddr()); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if member, voter := suffrage(t, leader, "node2"); !member || !voter {
+		t.Fatalf("after Join: member=%v voter=%v, want a voter", member, voter)
+	}
+	waitReady(t, n2)
+
+	// Asking a voter to join as nonvoter must not demote it.
+	if err := leader.JoinNonvoter("node2", n2.RaftAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, voter := suffrage(t, leader, "node2"); !voter {
+		t.Error("JoinNonvoter demoted a voter")
+	}
+	if st, _ := leader.Status(); len(st.Members) != 3 {
+		t.Errorf("members = %v, want 3", st.Members)
+	}
+}
+
+func TestHTTPAddr(t *testing.T) {
+	s := &Store{cfg: Config{Peers: map[string]string{"node1": "n1.example:9000"}, HTTPPort: "8080"}}
+	cases := []struct {
+		id, raftAddr, want string
+		ok                 bool
+	}{
+		{"node1", "anything:7000", "n1.example:9000", true}, // PEERS_HTTP wins
+		{"quorum-2", "quorum-2.quorum-headless.ns.svc.cluster.local:7000", "quorum-2.quorum-headless.ns.svc.cluster.local:8080", true},
+		{"quorum-2", "no-port", "", false},
+	}
+	for _, c := range cases {
+		if got, ok := s.httpAddr(c.id, c.raftAddr); got != c.want || ok != c.ok {
+			t.Errorf("httpAddr(%q, %q) = %q, %v; want %q, %v", c.id, c.raftAddr, got, ok, c.want, c.ok)
+		}
+	}
+	// Without PEERS_HTTP or an HTTP port, there's nothing to go on.
+	if _, ok := (&Store{}).httpAddr("quorum-2", "quorum-2:7000"); ok {
+		t.Error("httpAddr without peers or HTTPPort: want ok=false")
 	}
 }

@@ -6,6 +6,11 @@
 #   scripts/kill-leader.sh                      # delete the leader pod every 30s
 #   INTERVAL=15 COUNT=4 scripts/kill-leader.sh  # 4 times, 15s apart
 #   MODE=kill scripts/kill-leader.sh            # crash it instead (see below)
+#   TARGET=follower MODE=kill COUNT=1 INTERVAL=0 scripts/kill-leader.sh
+#                                               # crash one follower, now
+#
+# TARGET=leader (default) takes down the Raft leader; TARGET=follower takes
+# down a follower instead (the first one found).
 #
 # MODE=delete (default) deletes the leader's pod. Kubernetes sends SIGTERM
 # first, so the server hands leadership to another node before exiting. This
@@ -32,6 +37,7 @@ CLUSTER=${CLUSTER:-quorum} # QuorumCluster name
 INTERVAL=${INTERVAL:-30}
 COUNT=${COUNT:-0} # 0 = forever
 MODE=${MODE:-delete}
+TARGET=${TARGET:-leader}
 
 case "$MODE" in
 delete | kill) ;;
@@ -40,18 +46,25 @@ delete | kill) ;;
 	exit 2
 	;;
 esac
+case "$TARGET" in
+leader | follower) ;;
+*)
+	echo "TARGET must be leader or follower" >&2
+	exit 2
+	;;
+esac
 
-# find_leader prints the name of the pod that says it is the leader.
-# It asks each pod's GET /status through the API server's pod proxy, which
-# works from outside the cluster without port-forwarding. (kubectl exec
-# would need a shell, which the distroless image doesn't have.)
-find_leader() {
+# find_target prints the name of a pod in Raft state TARGET (leader or
+# follower). It asks each pod's GET /status through the API server's pod
+# proxy, which works from outside the cluster without port-forwarding.
+# (kubectl exec would need a shell, which the distroless image doesn't have.)
+find_target() {
 	local pods pod
 	pods=$(kubectl -n "$NS" get pods -l "app.kubernetes.io/name=quorum,app.kubernetes.io/instance=$CLUSTER" \
 		-o jsonpath='{.items[*].metadata.name}')
 	for pod in $pods; do
 		if kubectl get --raw "/api/v1/namespaces/$NS/pods/$pod:8080/proxy/status" 2>/dev/null |
-			grep -q '"state":"leader"'; then
+			grep -q "\"state\":\"$TARGET\""; then
 			echo "$pod"
 			return 0
 		fi
@@ -94,7 +107,7 @@ wait_healthy() {
 	echo "$waited"
 }
 
-echo "taking down the leader of $NS/$CLUSTER every ${INTERVAL}s (mode: $MODE, count: ${COUNT/#0/unlimited})"
+echo "taking down the $TARGET of $NS/$CLUSTER every ${INTERVAL}s (mode: $MODE, count: ${COUNT/#0/unlimited})"
 done_count=0
 while [ "$COUNT" -eq 0 ] || [ "$done_count" -lt "$COUNT" ]; do
 	sleep "$INTERVAL"
@@ -103,18 +116,18 @@ while [ "$COUNT" -eq 0 ] || [ "$done_count" -lt "$COUNT" ]; do
 		echo "$(date -u +%H:%M:%S)  waited ${waited}s for all pods to be ready"
 	fi
 	ts=$(date -u +%H:%M:%S)
-	if ! leader=$(find_leader); then
+	if ! victim=$(find_target); then
 		# Probably still electing after the last round. Try next time.
-		echo "$ts  no leader found, skipping this round"
+		echo "$ts  no $TARGET found, skipping this round"
 		continue
 	fi
 	if [ "$MODE" = kill ]; then
-		crash "$leader"
+		crash "$victim"
 		what="crashed (SIGKILL)"
 	else
-		kubectl -n "$NS" delete pod "$leader" --wait=false >/dev/null
+		kubectl -n "$NS" delete pod "$victim" --wait=false >/dev/null
 		what="deleted"
 	fi
 	done_count=$((done_count + 1))
-	echo "$ts  $what leader $leader [$done_count]"
+	echo "$ts  $what $TARGET $victim [$done_count]"
 done
