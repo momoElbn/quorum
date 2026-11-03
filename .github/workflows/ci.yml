@@ -1,0 +1,57 @@
+# CI: runs on every pull request into main, and again after a merge into
+# main, so main is always known to build and pass its tests.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# The job only reads the code, so give the token read-only access.
+permissions:
+  contents: read
+
+# If you push again to a PR while CI is still running, cancel the old run:
+# only the result for the newest commit matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The Raft tests start real clusters and wait for elections. A deadlock
+    # should fail the job, not burn runner minutes for the 6-hour default.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Use the Go version from go.mod, so CI and local builds always match.
+      # setup-go also caches downloaded modules between runs.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        # gofmt -l lists files that aren't formatted; any output fails the step.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Run gofmt -w on these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check go.mod and go.sum are tidy
+        # Fails if go.mod/go.sum don't match the imports, e.g. a dependency
+        # was added without running go mod tidy.
+        run: go mod tidy -diff
+
+      - name: Test
+        # -race is required by the project rules: the store is used from
+        # Raft's goroutines and HTTP handlers at the same time.
+        run: go test -race ./...
