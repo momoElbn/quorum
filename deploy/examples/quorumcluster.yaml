@@ -1,0 +1,16 @@
+# A 3-node quorum-server cluster, managed by the quorum operator.
+#
+#   kubectl create namespace quorum
+#   kubectl apply -n quorum -f deploy/examples/quorumcluster.yaml
+#   kubectl get quorumclusters -n quorum      # or: kubectl get qc -n quorum
+#
+# The operator creates a StatefulSet "quorum" (pods quorum-0..2), Services
+# "quorum-headless" and "quorum", and a PodDisruptionBudget "quorum".
+apiVersion: quorum.momoelbn.github.io/v1alpha1
+kind: QuorumCluster
+metadata:
+  name: quorum
+spec:
+  replicas: 3 # can't be changed after creation yet
+  image: quorum-server:dev # changing it rolls the pods one at a time
+  storageSize: 1Gi # can't be changed after creation

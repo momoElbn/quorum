@@ -1,0 +1,73 @@
+# The operator's identity and permissions.
+#
+# ServiceAccount: the identity the operator pod uses to talk to the API
+# server. Every request it makes is checked against the roles below.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+---
+# ClusterRole: what the operator may do in every namespace. QuorumClusters
+# can live in any namespace, so this has to be cluster-wide.
+# The rules come from files/manager-role.yaml, which `make manifests` (in
+# operator/) generates from the +kubebuilder:rbac markers in the controller.
+# So the chart's permissions always match what the code needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+rules:
+  {{- (.Files.Get "files/manager-role.yaml" | fromYaml).rules | toYaml | nindent 2 }}
+---
+# ClusterRoleBinding: gives the ClusterRole to the operator's ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "quorum-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "quorum-operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Role for leader election, only in the operator's own namespace. During a
+# rolling update, the old and new operator pods run at the same time. Leader
+# election (a Lease object) makes sure only one of them reconciles, so the
+# two never fight over the same objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}-leader-election
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "quorum-operator.fullname" . }}-leader-election
+  labels:
+    {{- include "quorum-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "quorum-operator.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "quorum-operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}

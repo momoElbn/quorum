@@ -1,0 +1,64 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - quorum.momoelbn.github.io
+  resources:
+  - quorumclusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - quorum.momoelbn.github.io
+  resources:
+  - quorumclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - quorum.momoelbn.github.io
+  resources:
+  - quorumclusters/status
+  verbs:
+  - get
+  - patch
+  - update
