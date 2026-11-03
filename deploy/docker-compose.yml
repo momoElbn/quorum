@@ -1,0 +1,71 @@
+# A local 3-node quorum-server cluster.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   scripts/status.sh
+#
+# Clients on this machine use localhost:8081, :8082 and :8083. The Raft port
+# (7000) is not published: only the nodes talk Raft, over the compose
+# network, where they reach each other by service name (node1, node2, ...).
+name: quorum
+
+# Settings shared by all three nodes (YAML anchor, merged in with <<).
+x-node: &node
+  build:
+    context: ..
+  image: quorum-server:dev
+  restart: unless-stopped
+  # On `docker compose stop`, the node gets SIGTERM, then SIGKILL after this
+  # long. 30s matches Kubernetes' default, and leaves time to finish
+  # in-flight requests and hand off leadership.
+  stop_grace_period: 30s
+
+x-env: &env
+  HTTP_ADDR: ":8080"
+  DATA_DIR: /data
+  # Followers redirect clients to the leader using these addresses. They are
+  # the host-side ports, because the clients (curl, the scripts) run on this
+  # machine, not inside the compose network.
+  # Downside: a node *inside* the network can't follow these redirects.
+  # That only matters if a join lands on a follower, so JOIN_ADDR points at
+  # node1, which is the leader when the cluster first forms.
+  PEERS_HTTP: "node1=localhost:8081,node2=localhost:8082,node3=localhost:8083"
+
+services:
+  node1:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node1
+      RAFT_ADDR: node1:7000
+      # Creates the cluster the first time, when its volume is empty.
+      # Ignored on later starts, because Raft state is already on disk.
+      BOOTSTRAP: "true"
+    ports: ["127.0.0.1:8081:8080"]
+    volumes: [node1-data:/data]
+
+  node2:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node2
+      RAFT_ADDR: node2:7000
+      JOIN_ADDR: node1:8080 # retried with backoff until node1 is up and leader
+    ports: ["127.0.0.1:8082:8080"]
+    volumes: [node2-data:/data]
+
+  node3:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node3
+      RAFT_ADDR: node3:7000
+      JOIN_ADDR: node1:8080
+    ports: ["127.0.0.1:8083:8080"]
+    volumes: [node3-data:/data]
+
+# One named volume per node: each node keeps its own Raft log and snapshots
+# across restarts. `docker compose down -v` deletes them for a fresh cluster.
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
