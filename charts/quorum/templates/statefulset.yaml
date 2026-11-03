@@ -108,12 +108,18 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           # Readiness controls whether the client Service sends traffic here.
+          # /readyz fails while the pod can't serve clients: no leader, no
+          # recent contact with it, not a voter, or far behind on applying
+          # the log. A failing pod leaves the Service but isn't restarted.
+          # Checked every second, so it leaves within ~3s and is back 1s
+          # after it recovers.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
-            periodSeconds: 5
-            failureThreshold: 2
+            periodSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:

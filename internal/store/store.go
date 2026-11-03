@@ -58,6 +58,11 @@ type Config struct {
 
 	DataDir string // where the Raft log, stable store and snapshots live
 
+	// Peers maps node IDs to HTTP addresses (PEERS_HTTP). The store itself
+	// never dials them; Ready only checks that the leader is listed, because
+	// a follower can't redirect clients to a leader it has no address for.
+	Peers map[string]string
+
 	LogOutput io.Writer // where Raft writes its logs; nil means os.Stderr
 }
 

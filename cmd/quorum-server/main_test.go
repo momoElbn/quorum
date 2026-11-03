@@ -129,7 +129,9 @@ func startCluster(t *testing.T) []*node {
 	var nodes []*node
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("node%d", i)
-		st := store.New(store.Config{NodeID: id, RaftBind: "127.0.0.1:0", DataDir: t.TempDir(), LogOutput: io.Discard})
+		// Ready reads peers. It is complete by the end of this loop, before
+		// any handler or test calls Ready.
+		st := store.New(store.Config{NodeID: id, RaftBind: "127.0.0.1:0", DataDir: t.TempDir(), Peers: peers, LogOutput: io.Discard})
 		if err := st.Open(i == 0); err != nil {
 			t.Fatal(err)
 		}
@@ -237,6 +239,11 @@ func TestFollowerRedirectsToLeader(t *testing.T) {
 	if resp, _ := do(t, http.DefaultClient, http.MethodGet, "http://"+follower.addr+"/healthz", ""); resp.StatusCode != http.StatusOK {
 		t.Errorf("/healthz: status %d", resp.StatusCode)
 	}
+	for _, n := range []*node{leader, follower} {
+		if resp, body := do(t, http.DefaultClient, http.MethodGet, "http://"+n.addr+"/readyz", ""); resp.StatusCode != http.StatusOK {
+			t.Errorf("/readyz on %s: %d %s", n.id, resp.StatusCode, body)
+		}
+	}
 
 	// The follower counted the redirects, and the leader the actual writes.
 	_, fm := do(t, http.DefaultClient, http.MethodGet, "http://"+follower.addr+"/metrics", "")
@@ -250,5 +257,25 @@ func TestFollowerRedirectsToLeader(t *testing.T) {
 		if !strings.Contains(lm, want) {
 			t.Errorf("leader /metrics missing %q", want)
 		}
+	}
+}
+
+// A node that hasn't joined a cluster is alive but not ready, and /readyz
+// says why.
+func TestReadyzReportsReason(t *testing.T) {
+	st := store.New(store.Config{NodeID: "node1", RaftBind: "127.0.0.1:0", DataDir: t.TempDir(), LogOutput: io.Discard})
+	if err := st.Open(false); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := httptest.NewServer(newHandler(st, map[string]string{}, prometheus.NewRegistry()))
+	t.Cleanup(srv.Close)
+
+	if resp, body := do(t, http.DefaultClient, http.MethodGet, srv.URL+"/readyz", ""); resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(body, "no leader known") {
+		t.Errorf("/readyz: %d %q, want 503 with \"no leader known\"", resp.StatusCode, body)
+	}
+	// Liveness doesn't care about the leader.
+	if resp, _ := do(t, http.DefaultClient, http.MethodGet, srv.URL+"/healthz", ""); resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz: status %d, want 200", resp.StatusCode)
 	}
 }

@@ -112,6 +112,7 @@ func main() {
 		RaftAddr: cfg.RaftAddr,
 		RaftBind: cfg.RaftBind,
 		DataDir:  cfg.DataDir,
+		Peers:    cfg.Peers,
 	})
 	if err := st.Open(cfg.Bootstrap); err != nil {
 		log.Fatal(err)
