@@ -105,6 +105,20 @@ wait_scaled() {
 	step_log+=("$(now) $label: done")
 }
 
+# print_members shows the Raft configuration as the leader sees it.
+print_members() {
+	local leader
+	leader=$(qc '{.status.leader}')
+	if [ -z "$leader" ]; then
+		echo "no leader: the QuorumCluster reports none (no majority?)"
+		return
+	fi
+	echo "Raft members according to the leader ($leader):"
+	kubectl get --raw "/api/v1/namespaces/$NS/pods/$leader:8080/proxy/status" |
+		grep -o '"id":"[^"]*","raft_addr":"[^"]*","voter":[a-z]*' |
+		sed 's/"id":"\([^"]*\)","raft_addr":"[^"]*","voter":\(.*\)/  \1  voter=\2/'
+}
+
 hold() {
 	log "hold $1 s"
 	sleep "$1"
@@ -165,6 +179,7 @@ patch_qc '{"spec":{"replicas":3}}'
 wait_scaled 3 "5->3"
 down_end=$(now)
 log "scaled to 3 in $((down_end - down_start)) s"
+print_members
 
 hold 60
 
@@ -177,15 +192,7 @@ hold 120
 
 echo
 log "summary"
-leader=$(qc '{.status.leader}')
-if [ -n "$leader" ]; then
-	echo "Raft members according to the leader ($leader):"
-	kubectl get --raw "/api/v1/namespaces/$NS/pods/$leader:8080/proxy/status" |
-		grep -o '"id":"[^"]*","raft_addr":"[^"]*","voter":[a-z]*' |
-		sed 's/"id":"\([^"]*\)","raft_addr":"[^"]*","voter":\(.*\)/  \1  voter=\2/'
-else
-	echo "no leader: the QuorumCluster reports none (no majority?)"
-fi
+print_members
 
 echo
 echo "scale to 5: $((up_end - up_start)) s    scale to 3: $((down_end - down_start)) s"

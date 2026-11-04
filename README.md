@@ -7,7 +7,7 @@ upgrades. A write is acknowledged only after a majority has stored it, so the
 cluster survives the loss of any one node without losing data.
 
 - **quorum-server** (`cmd/quorum-server`): HTTP API (`PUT/GET/DELETE /kv/{key}`). Followers redirect to the leader with `307`; reads are linearizable.
-- **quorum-operator** (`operator/`): turns a `QuorumCluster` resource into a StatefulSet, two Services and a PodDisruptionBudget, and reports Raft health in its status.
+- **quorum-operator** (`operator/`): turns a `QuorumCluster` resource into a StatefulSet, two Services and a PodDisruptionBudget, reports Raft health in its status, and scales the Raft membership one member at a time when `spec.replicas` changes.
 - **quorum-checker** (`cmd/quorum-checker`): writes unique keys at a fixed rate, reads every acknowledged one back, and measures unavailability.
 - **[quorum-gitops](https://github.com/momoElbn/quorum-gitops)**: everything that runs in the cluster, deployed by Argo CD.
 
@@ -124,6 +124,83 @@ server never reach it, so only the checker sees those failures.*
 | Fault | leader SIGKILLed every 60 s, 29 times; next kill only once all 3 pods are Ready |
 | Version | runs 1 and 2: commit `be31ee1`; run 3: commit `1e59c36` (readiness fix) |
 | Date | 2026-11-03; run 1 04:06–04:38 UTC, run 2 04:40–05:11 UTC, run 3 22:57–23:27 UTC |
+
+## Experiment E3: scaling
+
+| | |
+|---|---|
+| Question | Does scaling 3 → 5 → 3 under load lose writes, and how much fault tolerance is left afterwards? |
+| Safe mode | The operator adds each pod as a nonvoter, promotes it once it has caught up, and removes members from Raft before deleting their pods |
+| Unsafe mode | `spec.unsafeScaling: true`: pods join by themselves and the StatefulSet just follows `spec.replicas`; nothing is removed from Raft |
+| Metrics | Lost acknowledged writes; failed writes per phase; Raft members after 5 → 3; the cost of one follower crash after 5 → 3 |
+
+```bash
+RATE=100 DURATION=10m scripts/run-checker.sh   # terminal 1
+scripts/scale-experiment.sh                    # terminal 2; UNSAFE=1 for the baseline
+```
+
+`scale-experiment.sh` waits 60 s, scales to 5 and waits until it's done, holds
+120 s, scales to 3 and waits, holds 60 s, SIGKILLs one follower, and holds
+120 s. It prints a UTC timestamp for every event, which is how failed writes
+are split by phase. Each mode ran twice, each run on a fresh 3-node cluster.
+Unsafe runs need that anyway, because they leave ghost members behind.
+
+### Results
+
+| | Safe 1 | Safe 2 | Unsafe 1 | Unsafe 2 |
+|---|---|---|---|---|
+| Writes sent / acknowledged | 59,999 / 59,997 | 59,999 / 59,999 | 60,000 / 59,408 | 60,000 / 59,393 |
+| **Lost acknowledged writes** | **0** | **0** | **0** | **0** |
+| Failed writes during 3 → 5 | 0 | 0 | 0 | 0 |
+| Failed writes during 5 → 3 | 1 | 0 | 1 | 1 |
+| **Raft members after 5 → 3** | **3** | **3** | **5** (2 without a pod) | **5** (2 without a pod) |
+| **Follower crash after 5 → 3: failed writes / longest outage** | **1 / 0.01 s** | **0 / 0 s** | **591 / 5.87 s** | **606 / 6.02 s** |
+| Time for 3 → 5 / 5 → 3 | 22 s / 3 s | 19 s / 1 s | 14 s / 2 s | 16 s / 2 s |
+
+- **Nothing was lost in either mode.** Raft never acknowledges a write that a majority hasn't stored, so naive scaling
+  doesn't lose data. It costs availability.
+- **Unsafe scale-down leaves ghost voters.** The StatefulSet deleted quorum-3 and quorum-4, but Raft still counted 5
+  voters, so 3 of 5 must answer. The follower crash left 2 of 5: no majority. The leader stepped down and writes failed
+  with `503 no leader elected yet` until the crashed pod was back, about 6 s later. That's short only because a killed
+  pod restarts quickly. If the node had died, writes would stay down until it came back.
+- **Safe scale-down shrinks the majority with the membership** (5 → 4 → 3 voters), so the same crash leaves 2 of 3, which
+  is still a majority. Safe 2 had no failed writes at all. The single failures in safe 1 and at 5 → 3 were the client
+  Service sending a request to a pod at the moment it went away (connection refused or reset), not Raft.
+- **Safe scaling is a little slower** going up (19–22 s vs 14–16 s), because each new member catches up and is promoted
+  before the next pod starts. Going down, both take 1–3 s.
+- **"Applied anyway":** 56 and 54 of the unsafe runs' failed writes were committed after all: the leader lost its
+  majority mid-commit (`leadership lost while committing log`), and Raft committed the entries once the majority was
+  back.
+
+So: safe scaling took the cluster 3 → 5 → 3 under 100 writes/s with 0 lost writes and then absorbed a follower crash with
+0–1 failed writes. After naive scaling, the same crash caused a 5.9–6.0 s total write outage (about 600 failed writes).
+
+![Grafana dashboard during E3, safe mode](docs/e3-safe.png)
+
+*Safe run 1: quorum-3 and quorum-4 join as followers and leave again, and quorum-0 stays the leader throughout. p99
+write latency rises from about 100 ms to about 500 ms while there are 5 voters: a write needs 3 acknowledgements
+instead of 2.*
+
+![Grafana dashboard during E3, unsafe mode](docs/e3-unsafe.png)
+
+*Unsafe run 1: after the follower crash at 00:20:24, the leader moves from quorum-1 to quorum-2, and the server reports
+write errors (`leadership lost while committing log`). The dashboard can't show the ghost voters: quorum-3 and
+quorum-4 disappear from the chart but are still in Raft's configuration.*
+
+### Test conditions
+
+Same PC, WSL2, Docker (12 CPUs, 15.2 GiB) and k3d/k3s as E1.
+
+| | |
+|---|---|
+| Load | 100 writes/s for 10 min, 2 s client timeout, started before the timeline (after the switch to unsafe mode, so that rolling restart isn't counted) |
+| Version | quorum-server and quorum-operator at commit `4b57d9f` |
+| Date | 2026-11-03/04; safe 23:53 and 00:04 UTC, unsafe 00:16 and 00:28 UTC |
+| Cluster | recreated from scratch (QuorumCluster and volumes deleted) before the first run and before each unsafe run |
+
+Before E3, the cluster had to be recreated anyway: the ~540,000 keys left by the three E1 runs no longer fit in the
+pods' 256 MiB memory limit. The store keeps every key in memory, and a snapshot encodes the whole map at once, so the
+pods were OOMKilled at every snapshot or restart. That limit is a known issue.
 
 ## Repository layout
 
