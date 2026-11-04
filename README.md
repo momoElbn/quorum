@@ -1,27 +1,63 @@
+<div align="center">
+
 # Quorum
 
-Quorum is a 3-node key-value store replicated with Raft
-([hashicorp/raft](https://github.com/hashicorp/raft)), plus a Kubernetes
-operator that runs it and keeps it available through failures, scaling and
-upgrades. A write is acknowledged only after a majority has stored it, so the
-cluster survives the loss of any one node without losing data.
+**A Raft-replicated key-value store with a Kubernetes operator that keeps it available through crashes, scaling and upgrades, and the fault-injection experiments that prove it.**
 
-- **quorum-server** (`cmd/quorum-server`): HTTP API (`PUT/GET/DELETE /kv/{key}`). Followers redirect to the leader with `307`; reads are linearizable.
-- **quorum-operator** (`operator/`): turns a `QuorumCluster` resource into a StatefulSet, two Services and a PodDisruptionBudget, reports Raft health in its status, and scales the Raft membership one member at a time when `spec.replicas` changes.
-- **quorum-checker** (`cmd/quorum-checker`): writes unique keys at a fixed rate, reads every acknowledged one back, and measures unavailability.
-- **[quorum-gitops](https://github.com/momoElbn/quorum-gitops)**: everything that runs in the cluster, deployed by Argo CD.
+![Go](https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=white)
+![Raft](https://img.shields.io/badge/Raft-hashicorp%2Fraft-7B42BC)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?logo=kubernetes&logoColor=white)
+![Kubebuilder](https://img.shields.io/badge/Operator-kubebuilder-326CE5)
+![Helm](https://img.shields.io/badge/Helm-0F1689?logo=helm&logoColor=white)
+![Argo CD](https://img.shields.io/badge/GitOps-Argo%20CD-EF7B4D?logo=argo&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-F46800?logo=grafana&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)
 
-Design decisions: [docs/decisions.md](docs/decisions.md).
+</div>
 
-## Architecture
+## Results at a glance
+
+| | |
+|---|---|
+| 🛡️ **0 lost acknowledged writes** | across **517,331** acknowledged writes and **86 leader kills** (SIGKILL, 3 runs of 30 min at 100 writes/s) |
+| ⚡ **~2 s median failover** | median write outage of 2.05–2.22 s after a leader crash, matching Raft's election timeout |
+| 🩺 **Readiness fix, measured** | a `/readyz` probe cut the kills followed by a second outage from 6 and 4 per run to 1 |
+| 📈 **Safe vs. unsafe scaling** | after scaling 3 → 5 → 3, one follower crash cost **0–1 failed writes** with the operator's safe scaling, versus **~600 failed writes and a ~6 s outage** with naive scaling |
+
+## Why
+
+"Survives the loss of one node" is easy to claim and hard to check. Quorum
+is a small but complete distributed system built to measure that claim: a
+write counts only once a majority has stored it, an operator handles the
+Kubernetes side, and a checker sends real load while faults are injected so
+data loss and downtime are measured, not assumed.
+
+## What
+
+| Component | Role |
+|---|---|
+| **quorum-server** (`cmd/quorum-server`) | 3-node KV store on [hashicorp/raft](https://github.com/hashicorp/raft). HTTP API `PUT/GET/DELETE /kv/{key}`, linearizable reads, followers redirect to the leader with `307`. |
+| **quorum-operator** (`operator/`) | Turns a `QuorumCluster` custom resource into a StatefulSet, two Services and a PodDisruptionBudget, reports Raft health in its status, and changes Raft membership one member at a time when `spec.replicas` changes. |
+| **quorum-checker** (`cmd/quorum-checker`) | Writes unique keys at a fixed rate, reads every acknowledged one back, and measures unavailability. |
+| **[quorum-gitops](https://github.com/momoElbn/quorum-gitops)** | Everything that runs in the cluster, deployed by Argo CD. |
+
+Design decisions are written up in [docs/decisions.md](docs/decisions.md).
+
+## How
 
 ![Quorum architecture](docs/quorum-architecture-light.drawio.png)
 
-Editable source: [docs/architecture.drawio](docs/architecture.drawio) (open it in [draw.io](https://app.diagrams.net)).
+<sub>Editable source: [docs/architecture.drawio](docs/architecture.drawio) (open it in [draw.io](https://app.diagrams.net)).</sub>
 
-## Run it from scratch
+- **Consensus:** Raft commits a write only after a majority has it, so a single node failure can't lose acknowledged data.
+- **Operator-managed membership:** new pods join as nonvoters, are promoted once caught up, and are removed from Raft *before* their pods are deleted, so the majority always matches the real cluster.
+- **Health-aware traffic:** `/readyz` reports Ready only when a pod knows the current leader, so clients never reach a pod that would answer `503 no leader`.
+- **GitOps and CI:** GitHub Actions tests, builds and pushes images to GHCR, then deploys through quorum-gitops and Argo CD. Prometheus and Grafana observe the cluster.
 
-You need Docker, [k3d](https://k3d.io) 5.9+, kubectl and git.
+## Quick start
+
+You need Docker, [k3d](https://k3d.io) 5.9+, kubectl and git. Images are public on GHCR, so nothing needs to be built.
 
 ```bash
 git clone https://github.com/momoElbn/quorum-gitops
@@ -30,8 +66,10 @@ scripts/bootstrap.sh                      # k3d cluster, Argo CD, root app
 kubectl -n quorum get quorumcluster -w    # wait until PHASE is Running
 ```
 
-Argo CD deploys kube-prometheus-stack, the operator and a 3-node
-`QuorumCluster` from Git. The images are public on GHCR, so you don't build anything.
+Argo CD deploys kube-prometheus-stack, the operator and a 3-node `QuorumCluster` from Git.
+
+<details>
+<summary><b>Write and read a key, open Grafana, or run without Kubernetes</b></summary>
 
 Write and read a key from inside the cluster (followers redirect to in-cluster DNS names):
 
@@ -47,13 +85,17 @@ kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
 # http://localhost:3000, user admin, password admin-local-only (local cluster only)
 ```
 
-Without Kubernetes: `docker compose -f deploy/docker-compose.yml up -d --build`,
-then `scripts/status.sh`.
+Without Kubernetes: `docker compose -f deploy/docker-compose.yml up -d --build`, then `scripts/status.sh`.
+
+</details>
+
+---
 
 ## Experiment E1: leader failure
 
-**Question:** when the leader crashes, how long do writes fail, and are any
-acknowledged writes lost?
+> **Question:** when the leader crashes, how long do writes fail, and are any acknowledged writes lost?
+
+**Answer:** none were lost, and writes resumed after a median of about 2 s.
 
 ```bash
 RATE=100 DURATION=30m scripts/run-checker.sh          # terminal 1
@@ -86,8 +128,8 @@ gets client traffic only once it knows the leader.
 | Total time unavailable | 73.5 s (4.1 %) | 82.2 s (4.6 %) | 70.9 s (3.9 %) |
 | Failed writes that were applied anyway | 61 | 47 | 74 |
 
-¹ One round found no leader (an election was running) and was skipped, so the 29th kill came after the writes ended.
-² 21.11 s if you also count an election that started 18 s after the kill, with no kill causing it (see below).
+<sub>¹ One round found no leader (an election was running) and was skipped, so the 29th kill came after the writes ended.<br>
+² 21.11 s if you also count an election that started 18 s after the kill, with no kill causing it (see below).</sub>
 
 - **Nothing was lost:** all 517,331 acknowledged writes were read back correctly.
 - **Failover time:** for each kill, the longest write outage that starts within 5 s of it. The median of about 2 s
@@ -111,7 +153,8 @@ gets client traffic only once it knows the leader.
 stay at about 100/s. "Write errors" stays at 0 because requests to a crashed
 server never reach it, so only the checker sees those failures.*
 
-### Test conditions
+<details>
+<summary><b>Test conditions</b></summary>
 
 | | |
 |---|---|
@@ -125,11 +168,18 @@ server never reach it, so only the checker sees those failures.*
 | Version | runs 1 and 2: commit `be31ee1`; run 3: commit `1e59c36` (readiness fix) |
 | Date | 2026-11-03; run 1 04:06–04:38 UTC, run 2 04:40–05:11 UTC, run 3 22:57–23:27 UTC |
 
+</details>
+
+---
+
 ## Experiment E3: scaling
+
+> **Question:** does scaling 3 → 5 → 3 under load lose writes, and how much fault tolerance is left afterwards?
+
+**Answer:** neither mode lost data, but only safe scaling kept the cluster's fault tolerance. After naive scaling, a single follower crash took writes down for about 6 s.
 
 | | |
 |---|---|
-| Question | Does scaling 3 → 5 → 3 under load lose writes, and how much fault tolerance is left afterwards? |
 | Safe mode | The operator adds each pod as a nonvoter, promotes it once it has caught up, and removes members from Raft before deleting their pods |
 | Unsafe mode | `spec.unsafeScaling: true`: pods join by themselves and the StatefulSet just follows `spec.replicas`; nothing is removed from Raft |
 | Metrics | Lost acknowledged writes; failed writes per phase; Raft members after 5 → 3; the cost of one follower crash after 5 → 3 |
@@ -187,7 +237,8 @@ instead of 2.*
 write errors (`leadership lost while committing log`). The dashboard can't show the ghost voters: quorum-3 and
 quorum-4 disappear from the chart but are still in Raft's configuration.*
 
-### Test conditions
+<details>
+<summary><b>Test conditions</b></summary>
 
 Same PC, WSL2, Docker (12 CPUs, 15.2 GiB) and k3d/k3s as E1.
 
@@ -198,9 +249,15 @@ Same PC, WSL2, Docker (12 CPUs, 15.2 GiB) and k3d/k3s as E1.
 | Date | 2026-11-03/04; safe 23:53 and 00:04 UTC, unsafe 00:16 and 00:28 UTC |
 | Cluster | recreated from scratch (QuorumCluster and volumes deleted) before the first run and before each unsafe run |
 
-Before E3, the cluster had to be recreated anyway: the ~540,000 keys left by the three E1 runs no longer fit in the
-pods' 256 MiB memory limit. The store keeps every key in memory, and a snapshot encodes the whole map at once, so the
-pods were OOMKilled at every snapshot or restart. That limit is a known issue.
+</details>
+
+---
+
+## Known limitation
+
+The store keeps every key in memory, and a snapshot encodes the whole map at once. After the three E1 runs, the
+~540,000 keys no longer fit in the pods' 256 MiB memory limit, so the pods were OOMKilled at every snapshot or restart
+and the cluster had to be recreated before E3. Streaming snapshots or an on-disk store would remove this limit.
 
 ## Repository layout
 
@@ -213,3 +270,4 @@ pods were OOMKilled at every snapshot or restart. That limit is a known issue.
 | `deploy/` | Docker Compose setup and an example `QuorumCluster` |
 | `scripts/` | `run-checker.sh`, `kill-leader.sh`, `scale-experiment.sh`, `status.sh`, `write-loop.sh` |
 | `.github/workflows/ci.yml` | test, build, push to GHCR, deploy via quorum-gitops |
+
