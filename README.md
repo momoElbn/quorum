@@ -46,7 +46,11 @@ Design decisions are written up in [docs/decisions.md](docs/decisions.md).
 
 ## How
 
-![Quorum architecture](docs/quorum-architecture-light.drawio.png)
+### Components
+![Quorum architecture](docs/quorum-components-preview.png)
+
+### Flow
+![Quorum architecture](docs/quorum-flow-preview.png)
 
 <sub>Editable source: [docs/architecture.drawio](docs/architecture.drawio) (open it in [draw.io](https://app.diagrams.net)).</sub>
 
